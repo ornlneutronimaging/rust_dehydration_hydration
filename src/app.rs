@@ -35,7 +35,7 @@ const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
 /// window. The MBIRJAX logo has a light- and a dark-background variant;
 /// the one matching the active theme is displayed.
 const IMAGING_LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
-const MBIRJAX_LOGO_LIGHT_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.jpeg");
+const MBIRJAX_LOGO_LIGHT_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.png");
 const MBIRJAX_LOGO_DARK_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo_dark_background.png");
 const LOGO_HEIGHT: f32 = 44.0;
 
@@ -257,7 +257,8 @@ impl DehydrationApp {
     }
 
     /// The two logos, side by side. The MBIRJAX variant matching the active
-    /// theme is shown (dark-on-white for light, white-on-black for dark).
+    /// theme is shown: the official transparent PNG (dark text) on light,
+    /// the white-on-black variant on dark.
     fn logos_row(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let [imaging, mbirjax_light, mbirjax_dark] = self.logo_tex.get_or_insert_with(|| {
