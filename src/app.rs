@@ -30,10 +30,11 @@ const MBIRJAX_VERSION: &str = "0.7.2";
 const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
 
 /// ORNL Neutron Imaging team logo (same asset as the other rust
-/// applications) and the Purdue University wordmark (mbirjax collaboration),
-/// embedded in the binary and shown at the bottom-left of the window.
+/// applications) and the MBIRJAX logo (the Purdue library the correction is
+/// a port of), embedded in the binary and shown at the bottom-left of the
+/// window.
 const IMAGING_LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
-const PURDUE_LOGO_BYTES: &[u8] = include_bytes!("../logos/PurdueUniversity.png");
+const MBIRJAX_LOGO_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.jpeg");
 const LOGO_HEIGHT: f32 = 44.0;
 
 fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
@@ -203,7 +204,7 @@ pub struct DehydrationApp {
     status: String,
     /// The "ℹ mbirjax" About dialog (algorithm provenance and versions).
     show_about: bool,
-    /// (imaging, purdue) logo textures, loaded on the first frame.
+    /// (imaging, mbirjax) logo textures, loaded on the first frame.
     logo_tex: Option<(Option<TextureHandle>, Option<TextureHandle>)>,
 }
 
@@ -252,15 +253,15 @@ impl DehydrationApp {
         }
     }
 
-    /// The two institutional logos, side by side. The Purdue wordmark is
-    /// black-on-transparent, so it sits on a white chip to stay readable in
-    /// the dark theme.
+    /// The two logos, side by side. The MBIRJAX wordmark is dark-on-white
+    /// (JPEG, no transparency), so it sits on a white rounded chip to look
+    /// intentional in the dark theme.
     fn logos_row(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (imaging, purdue) = self.logo_tex.get_or_insert_with(|| {
+        let (imaging, mbirjax) = self.logo_tex.get_or_insert_with(|| {
             (
                 load_logo(&ctx, "imaging_logo", IMAGING_LOGO_BYTES),
-                load_logo(&ctx, "purdue_logo", PURDUE_LOGO_BYTES),
+                load_logo(&ctx, "mbirjax_logo", MBIRJAX_LOGO_BYTES),
             )
         });
         ui.horizontal(|ui| {
@@ -268,16 +269,18 @@ impl DehydrationApp {
                 ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
                     .on_hover_text("Neutron Imaging — Oak Ridge National Laboratory");
             }
-            if let Some(tex) = purdue {
+            if let Some(tex) = mbirjax {
                 egui::Frame::new()
                     .fill(Color32::WHITE)
                     .corner_radius(4)
-                    .inner_margin(4)
+                    .inner_margin(2)
                     .show(ui, |ui| {
                         ui.add(
-                            egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT - 12.0),
+                            egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT - 8.0),
                         )
-                        .on_hover_text("Purdue University");
+                        .on_hover_text(format!(
+                            "MBIRJAX {MBIRJAX_VERSION} — Purdue University"
+                        ));
                     });
             }
         });
