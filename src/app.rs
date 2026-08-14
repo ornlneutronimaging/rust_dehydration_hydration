@@ -29,6 +29,22 @@ const COLORBAR_WIDTH: f32 = 78.0;
 const MBIRJAX_VERSION: &str = "0.7.2";
 const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
 
+/// ORNL Neutron Imaging team logo (same asset as the other rust
+/// applications) and the Purdue University wordmark (mbirjax collaboration),
+/// embedded in the binary and shown at the bottom-left of the window.
+const IMAGING_LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
+const PURDUE_LOGO_BYTES: &[u8] = include_bytes!("../logos/PurdueUniversity.png");
+const LOGO_HEIGHT: f32 = 44.0;
+
+fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    Some(ctx.load_texture(name, color_image, TextureOptions::LINEAR))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Raw,
@@ -187,6 +203,8 @@ pub struct DehydrationApp {
     status: String,
     /// The "ℹ mbirjax" About dialog (algorithm provenance and versions).
     show_about: bool,
+    /// (imaging, purdue) logo textures, loaded on the first frame.
+    logo_tex: Option<(Option<TextureHandle>, Option<TextureHandle>)>,
 }
 
 impl Default for DehydrationApp {
@@ -230,7 +248,39 @@ impl DehydrationApp {
             cursor: None,
             status: "Open a folder of TIFF images to begin.".to_owned(),
             show_about: false,
+            logo_tex: None,
         }
+    }
+
+    /// The two institutional logos, side by side. The Purdue wordmark is
+    /// black-on-transparent, so it sits on a white chip to stay readable in
+    /// the dark theme.
+    fn logos_row(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (imaging, purdue) = self.logo_tex.get_or_insert_with(|| {
+            (
+                load_logo(&ctx, "imaging_logo", IMAGING_LOGO_BYTES),
+                load_logo(&ctx, "purdue_logo", PURDUE_LOGO_BYTES),
+            )
+        });
+        ui.horizontal(|ui| {
+            if let Some(tex) = imaging {
+                ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
+                    .on_hover_text("Neutron Imaging — Oak Ridge National Laboratory");
+            }
+            if let Some(tex) = purdue {
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .corner_radius(4)
+                    .inner_margin(4)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT - 12.0),
+                        )
+                        .on_hover_text("Purdue University");
+                    });
+            }
+        });
     }
 
     // ----- about dialog ------------------------------------------------------
@@ -812,6 +862,42 @@ impl DehydrationApp {
     }
 
     fn params_panel(&mut self, ui: &mut egui::Ui) {
+        if let Some(stack) = &self.stack {
+            ui.heading("Data set");
+            ui.add_space(2.0);
+            if let Some(dir) = &self.input_dir {
+                ui.label(
+                    egui::RichText::new(dir.display().to_string())
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text("Folder the images were loaded from");
+            }
+            let (n, h, w) = (stack.n_frames(), stack.height, stack.width);
+            ui.label(format!("{n} images of {w}×{h} px"));
+            ui.label(format!(
+                "In memory: {} (f32), correction needs ≈{} more",
+                fmt_bytes(n as u64 * (h * w) as u64 * 4),
+                // (points × bands) f64 working matrix + f32 corrected stack
+                fmt_bytes(n as u64 * (h * w) as u64 * 12),
+            ));
+            if let (Some(first), Some(last)) = (stack.sources.first(), stack.sources.last()) {
+                let name = |p: &std::path::Path| {
+                    p.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
+                ui.label(
+                    egui::RichText::new(format!("{} … {}", name(first), name(last)))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text("First and last image file of the stack");
+            }
+            ui.add_space(6.0);
+            ui.separator();
+        }
+
         ui.heading("Correction parameters");
         ui.add_space(4.0);
 
@@ -1417,6 +1503,22 @@ fn colorize(img: &Array2<f32>, vmin: f32, vmax: f32, lut: &[[u8; 3]; 256]) -> eg
     egui::ColorImage::from_rgba_unmultiplied([w, h], &buf)
 }
 
+/// Human-readable byte count (KB/MB/GB, decimal).
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1000.0 && unit < UNITS.len() - 1 {
+        v /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
 /// Compact tick label for the log y-axis: linear-space value of a tick.
 fn fmt_axis(v: f64) -> String {
     let a = v.abs();
@@ -1472,9 +1574,20 @@ impl eframe::App for DehydrationApp {
             .resizable(true)
             .default_size(300.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.params_panel(ui);
-                });
+                // Logos pinned to the bottom-left corner of the window: the
+                // parameters scroll in the space above an explicitly reserved
+                // logo row, and a spacer pushes the row to the very bottom
+                // when the parameters are short.
+                let logo_row_height = LOGO_HEIGHT + 24.0;
+                let scroll_height = (ui.available_height() - logo_row_height).max(0.0);
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        self.params_panel(ui);
+                    });
+                ui.add_space((ui.available_height() - logo_row_height).max(0.0));
+                ui.separator();
+                self.logos_row(ui);
             });
         egui::CentralPanel::default().show(ui, |ui| {
             self.viewer(ui);

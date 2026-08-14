@@ -782,6 +782,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "image",
  "ndarray",
  "ndarray-npy",
  "rayon",
