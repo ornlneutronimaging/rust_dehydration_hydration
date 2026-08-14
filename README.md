@@ -39,7 +39,8 @@ Imaging*, vol. 11, pp. 663–677, 2025.
    compare the mean-intensity profiles of the corrected and uncorrected
    stacks across the image index. The region can be **moved** (drag inside
    it) and **resized** (drag one of its 8 handles) without redrawing; the
-   plot shows the image index / intensity under the cursor in its corner.
+   plot shows the image index / intensity under the cursor in its corner and
+   the y-axis can be toggled between linear and log scale.
 7. **💾 Export corrected images…** — pick an output folder; the corrected
    stack is written as 32-bit float TIFFs (input file names kept) into a new
    subfolder `<input-folder>_dehydration_hydration_corrected` (suffixed `_1`,

@@ -176,6 +176,8 @@ pub struct DehydrationApp {
     /// (uncorrected, corrected) mean intensity per frame over the region.
     profiles: Option<(Vec<f64>, Vec<f64>)>,
     profiles_dirty: bool,
+    /// Plot the profiles on a log10 y-axis (non-positive values are hidden).
+    log_y: bool,
 
     scale: f32,
     fit_requested: bool,
@@ -219,6 +221,7 @@ impl DehydrationApp {
             region_drag: None,
             profiles: None,
             profiles_dirty: false,
+            log_y: false,
             scale: 1.0,
             fit_requested: false,
             cursor: None,
@@ -1051,45 +1054,63 @@ impl DehydrationApp {
                         self.profiles_dirty = true;
                     }
                 }
-                if let Some(region) = self.region {
-                    ui.label(format!(
-                        "Profiles for region (rows {}:{}, columns {}:{})",
-                        region.top, region.bottom, region.left, region.right
-                    ));
-                }
+                ui.horizontal(|ui| {
+                    if let Some(region) = self.region {
+                        ui.label(format!(
+                            "Profiles for region (rows {}:{}, columns {}:{})",
+                            region.top, region.bottom, region.left, region.right
+                        ));
+                        ui.separator();
+                    }
+                    ui.label("Y-axis:");
+                    ui.selectable_value(&mut self.log_y, false, "Linear");
+                    ui.selectable_value(&mut self.log_y, true, "Log")
+                        .on_hover_text("log₁₀ scale; non-positive values are hidden");
+                });
                 if let Some((uncorrected, corrected)) = &self.profiles {
-                    let uncorr: PlotPoints = uncorrected
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &v)| [i as f64, v])
-                        .collect();
-                    let corr: PlotPoints = corrected
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &v)| [i as f64, v])
-                        .collect();
-                    Plot::new("profiles_plot")
+                    // In log mode the plotted values are log10(y); the axis
+                    // ticks and the cursor read-out convert back.
+                    let log_y = self.log_y;
+                    let series = |vals: &[f64]| -> PlotPoints {
+                        vals.iter()
+                            .enumerate()
+                            .filter(|&(_, &v)| !log_y || v > 0.0)
+                            .map(|(i, &v)| [i as f64, if log_y { v.log10() } else { v }])
+                            .collect()
+                    };
+                    let uncorr = series(uncorrected);
+                    let corr = series(corrected);
+                    let mut plot = Plot::new(("profiles_plot", log_y))
                         .legend(Legend::default())
                         .x_axis_label("Image index")
-                        .y_axis_label("Average intensity")
+                        .y_axis_label(if log_y {
+                            "Average intensity (log)"
+                        } else {
+                            "Average intensity"
+                        })
                         .coordinates_formatter(
                             Corner::LeftBottom,
-                            CoordinatesFormatter::new(|p, _| {
-                                format!("image {:.0}  —  intensity {:.5}", p.x, p.y)
+                            CoordinatesFormatter::new(move |p, _| {
+                                let y = if log_y { 10f64.powf(p.y) } else { p.y };
+                                format!("image {:.0}  —  intensity {y:.5}", p.x)
                             }),
-                        )
-                        .show(ui, |plot_ui| {
-                            plot_ui.points(
-                                Points::new("Uncorrected profile", uncorr)
-                                    .shape(MarkerShape::Cross)
-                                    .radius(3.0),
-                            );
-                            plot_ui.points(
-                                Points::new("Corrected profile", corr)
-                                    .shape(MarkerShape::Circle)
-                                    .radius(2.5),
-                            );
-                        });
+                        );
+                    if log_y {
+                        plot = plot
+                            .y_axis_formatter(|mark, _| fmt_axis(10f64.powf(mark.value)));
+                    }
+                    plot.show(ui, |plot_ui| {
+                        plot_ui.points(
+                            Points::new("Uncorrected profile", uncorr)
+                                .shape(MarkerShape::Cross)
+                                .radius(3.0),
+                        );
+                        plot_ui.points(
+                            Points::new("Corrected profile", corr)
+                                .shape(MarkerShape::Circle)
+                                .radius(2.5),
+                        );
+                    });
                 }
             });
         });
@@ -1352,6 +1373,22 @@ fn colorize(img: &Array2<f32>, vmin: f32, vmax: f32, lut: &[[u8; 3]; 256]) -> eg
         buf[i * 4 + 3] = 255;
     }
     egui::ColorImage::from_rgba_unmultiplied([w, h], &buf)
+}
+
+/// Compact tick label for the log y-axis: linear-space value of a tick.
+fn fmt_axis(v: f64) -> String {
+    let a = v.abs();
+    if a == 0.0 {
+        "0".to_owned()
+    } else if a >= 100_000.0 || a < 0.001 {
+        format!("{v:.1e}")
+    } else if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.4}")
+    }
 }
 
 /// Compact tick label: plain decimals in a comfortable range, scientific
