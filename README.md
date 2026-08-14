@@ -18,16 +18,20 @@ Imaging*, vol. 11, pp. 663–677, 2025.
 
 1. **Open Folder…** — select the folder containing the TIFF images to correct
    (when the folder has none, its subfolders are searched, like the notebook).
-   The **🕒 Recent** menu reopens one of the last 5 dataset folders
-   (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).
+   Files load in parallel; NaN/Inf pixels are zeroed (and counted in the
+   Data set panel). The **🕒 Recent** menu reopens one of the last 5 dataset
+   folders (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).
 2. **Raw data** view — slide through the images next to the integrated (sum)
-   image.
+   image. The **Data set** panel shows the folder, image count/size, and
+   memory footprint.
 3. **Correction parameters** (left panel):
    - **Dataset type** — `attenuation` or `transmission`, where
      attenuation = −log(transmission). Default `attenuation`.
    - **Number of materials** — how many different materials the data set
      contains (1–10, default 2). The NMF subspace dimension is
-     2 × this number (safety factor 2).
+     2 × this number (safety factor 2). **Auto** estimates it from the data
+     (log-linear noise fit to the singular values of sampled pixel spectra —
+     the `_estimate_subspace_dimension` algorithm of mbirjax).
    - **Beta loss** — `frobenius` (coordinate-descent solver) or
      `kullback-leibler` (multiplicative-update solver). Default `frobenius`.
    - **Max iterations** — NMF solver cap (50–1000, default 300).
@@ -35,18 +39,40 @@ Imaging*, vol. 11, pp. 663–677, 2025.
    cancel button; the image index is treated as the spectral axis, every
    pixel spectrum is projected onto a low-dimensional non-negative subspace
    (dehydration) and multiplied back (rehydration), discarding the noise
-   outside the subspace.
+   outside the subspace. **⚡ Preview** runs the same correction on
+   2×2-binned pixels (~4× faster) for parameter tuning; preview results are
+   labeled everywhere and cannot be exported.
 5. **Corrected vs raw** view — side-by-side comparison with shared contrast.
+   The right pane can switch to **Difference** (corrected − raw, symmetric
+   color range): structure there is what the correction removed.
 6. **Profiles** view — drag a region on the integrated corrected image and
    compare the mean-intensity profiles of the corrected and uncorrected
-   stacks across the image index. The region can be **moved** (drag inside
-   it) and **resized** (drag one of its 8 handles) without redrawing; the
-   plot shows the image index / intensity under the cursor in its corner and
-   the y-axis can be toggled between linear and log scale.
+   stacks. The region can be **moved** (drag inside it) and **resized**
+   (drag one of its 8 handles); **clicking a pixel** adds that single
+   pixel's spectrum to the plot. When a `*_Spectra.txt` sits next to the
+   images, the x-axis can switch from image index to **TOF (µs)** or
+   **wavelength (Å)** (λ = h·t/(mₙ·L), source–detector distance editable,
+   default 25 m). Linear/log y-axis toggle, cursor read-out in the plot
+   corner, and **📄 Save CSV…** writes the plotted profiles (with TOF/λ
+   columns when available).
 7. **💾 Export corrected images…** — pick an output folder; the corrected
    stack is written as 32-bit float TIFFs (input file names kept) into a new
    subfolder `<input-folder>_dehydration_hydration_corrected` (suffixed `_1`,
-   `_2`, … when it already exists).
+   `_2`, … when it already exists), together with a
+   **`correction_config.json`** provenance file recording the input folder,
+   parameters, versions, and timestamp.
+
+## Headless batch mode
+
+```bash
+dehydration_hydration /SNS/VENUS/IPTS-XXXX/.../Run_YYYY \
+    --run --output /path/to/output \
+    --materials 2 --dataset-type attenuation --beta-loss frobenius --max-iter 300
+```
+
+Runs the same load → correct → export pipeline without a window (progress on
+stderr, the created folder printed on stdout) — for scripting many runs or
+pipeline integration. `--bin N` runs spatially binned.
 
 The **ℹ mbirjax** button (top-right) shows the algorithm provenance: the
 mbirjax version the implementation is a port of (0.7.2, tracked as a

@@ -20,11 +20,17 @@
 //! * the final `W·H` product is computed in f64 and cast to f32 (Python
 //!   casts to f32 first).
 
-use crate::linalg::Rng;
+use crate::linalg::{randomized_svd, Rng};
 use crate::nmf::{nmf, BetaLoss, NmfConfig};
 use anyhow::Result;
-use ndarray::{s, Array2, Axis};
+use ndarray::{s, Array2, ArrayView2, Axis};
 use std::sync::atomic::AtomicBool;
+
+/// Version of the mbirjax library this module is a native port of. Bump
+/// after diffing the denoising functions of `mbirjax/hsnt.py` against the
+/// newer release (the HDF5 utilities in that file are not part of the port).
+pub const MBIRJAX_VERSION: &str = "0.7.2";
+pub const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DatasetType {
@@ -190,6 +196,56 @@ fn dehydrate(
     Ok((w, basis_ht, transmission))
 }
 
+/// Estimate the number of materials in a sample of pixel spectra — port of
+/// `_estimate_subspace_dimension` without the safety-factor scaling (the
+/// caller applies it): fit a log-linear noise model to the singular values
+/// over the 25–75 percentile window and count the leading singular values
+/// exceeding 1.5× the model's prediction.
+///
+/// `sample` is (pixels × bands); pass a few hundred randomly chosen pixel
+/// spectra (the Python original uses up to `num_bands` rows — sampling a
+/// few hundred gives the same estimate at a fraction of the cost).
+pub fn estimate_num_materials(sample: ArrayView2<f64>) -> usize {
+    let (m, n_bands) = sample.dim();
+    let k = m.min(n_bands);
+    if k < 4 {
+        return 1;
+    }
+
+    let svd = randomized_svd(sample, k, SEED ^ 0xE571);
+    let s = &svd.s;
+    let size = s.len();
+
+    // Percentile window [25%, 75%] of the singular value indices.
+    let start = ((0.25 * size as f64).floor() as usize).min(size.saturating_sub(2));
+    let stop = ((0.75 * size as f64).ceil() as usize).clamp(start + 2, size);
+
+    // Least-squares fit of log(s) ≈ a·n + b over the window.
+    let n_fit = (stop - start) as f64;
+    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+    for i in start..stop {
+        let x = i as f64;
+        let y = (s[i] + 1e-12).ln();
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    let denom = n_fit * sxx - sx * sx;
+    if denom.abs() < 1e-12 {
+        return 1;
+    }
+    let a = (n_fit * sxy - sx * sy) / denom;
+    let b = (sy - a * sx) / n_fit;
+
+    // Leading singular values above 1.5× the noise prediction are signal.
+    let threshold = 1.5;
+    (0..start)
+        .filter(|&i| s[i] > threshold * (a * i as f64 + b).exp())
+        .count()
+        .max(1)
+}
+
 /// Multiply the subspace data back onto the basis; convert back to
 /// transmission when the input was transmission.
 fn rehydrate(w: &Array2<f64>, ht: &Array2<f64>, transmission: bool) -> Array2<f32> {
@@ -269,6 +325,13 @@ mod tests {
         let out = hyper_denoise(noisy.clone(), &params, &cancel, &mut |_, _| {}).unwrap();
         assert_eq!(out.dim(), noisy.dim());
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn material_estimation_finds_two_materials() {
+        let (_, noisy) = synthetic(0.05);
+        let estimate = estimate_num_materials(noisy.view());
+        assert_eq!(estimate, 2, "synthetic data has exactly 2 materials");
     }
 
     #[test]

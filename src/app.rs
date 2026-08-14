@@ -6,10 +6,11 @@
 
 use crate::colormap::Colormap;
 use crate::correction::{start_correction, CorrectionMsg, CorrectionParams};
-use crate::export::{start_export, ExportMsg};
-use crate::hsnt::DatasetType;
+use crate::export::{start_export, ExportMsg, Provenance};
+use crate::hsnt::{estimate_num_materials, DatasetType, MBIRJAX_COMMIT, MBIRJAX_VERSION};
 use crate::loader::{self, ImageStack};
 use crate::nmf::BetaLoss;
+use crate::spectra;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
 use egui_plot::{Corner, CoordinatesFormatter, Legend, MarkerShape, Plot, PlotPoints, Points};
@@ -22,12 +23,11 @@ use std::sync::Arc;
 /// Width of the colorbar column: gradient strip + ticks + value labels.
 const COLORBAR_WIDTH: f32 = 78.0;
 
-/// Version of the mbirjax library whose `hsnt` module this application is a
-/// native port of. Bump when the port is re-checked against a newer mbirjax
-/// (the denoising functions of `mbirjax/hsnt.py` must be diffed — the HDF5
-/// utilities in that file are not part of the port).
-const MBIRJAX_VERSION: &str = "0.7.2";
-const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
+/// Spatial binning factor of the fast preview run.
+const PREVIEW_BIN: usize = 2;
+
+/// Number of randomly sampled pixel spectra used by the material estimation.
+const ESTIMATE_SAMPLE: usize = 384;
 
 /// ORNL Neutron Imaging team logo (same asset as the other rust
 /// applications) and the MBIRJAX logo (the Purdue library the correction is
@@ -84,9 +84,59 @@ struct ExportJob {
 struct ResultState {
     frames: Arc<Vec<Array2<f32>>>,
     integrated_mean: Array2<f32>,
+    /// The (binned) raw frames the run compared against — present only for
+    /// preview runs (bin > 1), where the input stack is not like-for-like.
+    binned_raw: Option<Vec<Array2<f32>>>,
+    /// Spatial binning factor (1 = full resolution, >1 = preview).
+    bin: usize,
     subspace_dimension: usize,
     elapsed_seconds: f64,
     params: CorrectionParams,
+}
+
+impl ResultState {
+    fn is_preview(&self) -> bool {
+        self.bin > 1
+    }
+
+    /// Corrected-frame dimensions (h, w) — the stack's when bin = 1.
+    fn dims(&self) -> (usize, usize) {
+        self.integrated_mean.dim()
+    }
+
+    /// The raw frame comparable to corrected frame `i` (binned for previews).
+    fn raw_frame<'a>(&'a self, stack: &'a ImageStack, i: usize) -> Option<&'a Array2<f32>> {
+        match &self.binned_raw {
+            Some(binned) => binned.get(i),
+            None => stack.frames.get(i),
+        }
+    }
+}
+
+/// What the right pane of the "Corrected vs raw" view shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPane {
+    Raw,
+    /// corrected − raw, on a symmetric color range around 0.
+    Difference,
+}
+
+/// X-axis of the profile plots.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XAxis {
+    Index,
+    TofUs,
+    LambdaAngstrom,
+}
+
+impl XAxis {
+    fn label(self) -> &'static str {
+        match self {
+            XAxis::Index => "Image index",
+            XAxis::TofUs => "TOF (µs)",
+            XAxis::LambdaAngstrom => "Wavelength (Å)",
+        }
+    }
 }
 
 /// Pixel region for the profile plots (half-open: `left..right`, `top..bottom`).
@@ -184,11 +234,19 @@ pub struct DehydrationApp {
     corr_job: Option<CorrJob>,
     export_job: Option<ExportJob>,
     last_export: Option<PathBuf>,
+    /// Background material-count estimation ("Auto" button).
+    estimate_job: Option<Receiver<usize>>,
+
+    /// Right pane of the "Corrected vs raw" view.
+    right_pane: RightPane,
 
     tex_left: Option<TextureHandle>,
     tex_right: Option<TextureHandle>,
     cbar_tex: Option<TextureHandle>,
     tex_dirty: bool,
+    /// The images currently on screen (owned copies, parallel to the
+    /// textures), for the cursor value read-out.
+    pane_cache: (Option<Array2<f32>>, Option<Array2<f32>>),
 
     region: Option<Region>,
     /// Live drag on the profile region: drawing a new one, moving it, or
@@ -196,9 +254,18 @@ pub struct DehydrationApp {
     region_drag: Option<RegionDrag>,
     /// (uncorrected, corrected) mean intensity per frame over the region.
     profiles: Option<(Vec<f64>, Vec<f64>)>,
+    /// (uncorrected, corrected) intensity per frame of the marked pixel.
+    pixel_profiles: Option<(Vec<f64>, Vec<f64>)>,
+    /// Pixel marked by clicking the profiles image (result coordinates).
+    pixel_marker: Option<(usize, usize)>,
     profiles_dirty: bool,
     /// Plot the profiles on a log10 y-axis (non-positive values are hidden).
     log_y: bool,
+    /// TOF axis (µs, one value per image) from the folder's *_Spectra.txt.
+    spectra_tof_us: Option<Vec<f64>>,
+    x_axis: XAxis,
+    /// Source–detector distance for the wavelength conversion (m).
+    distance_m: f64,
 
     scale: f32,
     fit_requested: bool,
@@ -238,15 +305,23 @@ impl DehydrationApp {
             corr_job: None,
             export_job: None,
             last_export: None,
+            estimate_job: None,
+            right_pane: RightPane::Raw,
             tex_left: None,
             tex_right: None,
             cbar_tex: None,
             tex_dirty: false,
+            pane_cache: (None, None),
             region: None,
             region_drag: None,
             profiles: None,
+            pixel_profiles: None,
+            pixel_marker: None,
             profiles_dirty: false,
             log_y: false,
+            spectra_tof_us: None,
+            x_axis: XAxis::Index,
+            distance_m: spectra::DEFAULT_DISTANCE_M,
             scale: 1.0,
             fit_requested: false,
             cursor: None,
@@ -347,11 +422,15 @@ impl DehydrationApp {
         }
         let total = paths.len();
         let (tx, rx) = std::sync::mpsc::channel();
-        let progress_tx = tx.clone();
+        // Loading is parallel, so the progress callback fires from worker
+        // threads; the channel sender goes behind a mutex (Sender is !Sync).
+        let progress_tx = std::sync::Mutex::new(tx.clone());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let result = loader::load_paths_with_progress(&paths, |done, total| {
-                let _ = progress_tx.send(LoadMsg::Progress { done, total });
+                if let Ok(sender) = progress_tx.lock() {
+                    let _ = sender.send(LoadMsg::Progress { done, total });
+                }
                 ctx.request_repaint();
             });
             let _ = tx.send(LoadMsg::Done(result));
@@ -401,9 +480,23 @@ impl DehydrationApp {
         }
         self.integrated_raw = Some(acc);
 
+        // TOF axis from the folder's *_Spectra.txt, when it matches the
+        // stack (one TOF value per image).
+        self.spectra_tof_us = self
+            .input_dir
+            .as_ref()
+            .and_then(|dir| spectra::find_spectra_file(dir))
+            .and_then(|path| spectra::load_tof_us(&path).ok())
+            .filter(|tof| tof.len() == n);
+        if self.spectra_tof_us.is_none() {
+            self.x_axis = XAxis::Index;
+        }
+
         self.stack = Some(Arc::new(stack));
         self.result = None;
         self.profiles = None;
+        self.pixel_profiles = None;
+        self.pixel_marker = None;
         self.region = None;
         self.last_export = None;
         self.view = View::Raw;
@@ -411,23 +504,84 @@ impl DehydrationApp {
         self.contrast_auto = true;
         self.fit_requested = true;
         self.tex_dirty = true;
-        self.status = format!("Loaded {n} image(s), {w}×{h} px.");
+        let spectra_note = if self.spectra_tof_us.is_some() {
+            " TOF axis found (Spectra.txt)."
+        } else {
+            ""
+        };
+        self.status = format!("Loaded {n} image(s), {w}×{h} px.{spectra_note}");
+    }
+
+    // ----- material estimation ("Auto") --------------------------------------
+
+    /// Estimate the number of materials from a random sample of pixel
+    /// spectra, on a background thread (the SVD takes a few seconds).
+    fn start_estimation(&mut self, ctx: &egui::Context) {
+        let Some(stack) = self.stack.clone() else {
+            return;
+        };
+        let dataset_type = self.params.dataset_type;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let (h, w, n) = (stack.height, stack.width, stack.frames.len());
+            let points = h * w;
+            let sample_size = ESTIMATE_SAMPLE.min(points);
+            let mut rng = crate::linalg::Rng::new(0xE571_AA7E);
+            let mut sample = Array2::<f64>::zeros((sample_size, n));
+            for row in 0..sample_size {
+                let p = (rng.next_u64() % points as u64) as usize;
+                let (y, x) = (p / w, p % w);
+                for (i, frame) in stack.frames.iter().enumerate() {
+                    let mut v = f64::from(frame[(y, x)]);
+                    // Same preprocessing as dehydrate(): the estimation runs
+                    // in the attenuation domain.
+                    if dataset_type == DatasetType::Transmission {
+                        v = -v.max(1e-3).ln();
+                    }
+                    sample[(row, i)] = v.max(0.0);
+                }
+            }
+            let estimate = estimate_num_materials(sample.view());
+            let _ = tx.send(estimate);
+            ctx.request_repaint();
+        });
+        self.estimate_job = Some(rx);
+        self.status = "Estimating the number of materials…".to_owned();
+    }
+
+    fn poll_estimation(&mut self) {
+        let Some(rx) = &self.estimate_job else { return };
+        if let Ok(estimate) = rx.try_recv() {
+            self.estimate_job = None;
+            self.params.num_materials = estimate.clamp(1, 10);
+            self.status = format!(
+                "Estimated {estimate} material(s) from {ESTIMATE_SAMPLE} sampled pixel spectra \
+                 (subspace dimension {}).",
+                (2 * estimate).min(20)
+            );
+        }
     }
 
     // ----- correction job ----------------------------------------------------
 
-    fn start_correction_job(&mut self, ctx: &egui::Context) {
+    fn start_correction_job(&mut self, ctx: &egui::Context, bin: usize) {
         let Some(stack) = &self.stack else { return };
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = start_correction(stack.clone(), self.params, cancel.clone(), ctx.clone());
+        let rx = start_correction(stack.clone(), self.params, bin, cancel.clone(), ctx.clone());
         self.corr_job = Some(CorrJob {
             rx,
             stage: "Starting…".to_owned(),
             fraction: 0.0,
             cancel,
         });
+        let mode = if bin > 1 {
+            format!("preview, {bin}×{bin} binned, ")
+        } else {
+            String::new()
+        };
         self.status = format!(
-            "Correction running ({}, {} materials, {}, {} iterations max)…",
+            "Correction running ({mode}{}, {} materials, {}, {} iterations max)…",
             self.params.dataset_type.label(),
             self.params.num_materials,
             self.params.beta_loss.label(),
@@ -453,17 +607,26 @@ impl DehydrationApp {
         match res {
             Ok(out) => {
                 let (h, w) = out.integrated_mean.dim();
+                let preview_note = if out.is_preview() {
+                    format!(" — PREVIEW at {0}×{0} binning", out.bin)
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "Correction done in {:.1} s (subspace dimension {}).",
+                    "Correction done in {:.1} s (subspace dimension {}){preview_note}.",
                     out.elapsed_seconds, out.subspace_dimension
                 );
                 self.result = Some(ResultState {
                     frames: Arc::new(out.frames),
                     integrated_mean: out.integrated_mean,
+                    binned_raw: out.binned_raw,
+                    bin: out.bin,
                     subspace_dimension: out.subspace_dimension,
                     elapsed_seconds: out.elapsed_seconds,
                     params: self.params,
                 });
+                self.pixel_marker = None;
+                self.pixel_profiles = None;
                 // The notebook's default profile region: the second quarter
                 // of the image in both directions.
                 self.region = Some(
@@ -492,6 +655,11 @@ impl DehydrationApp {
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.result else { return };
         let Some(stack) = &self.stack else { return };
+        if result.is_preview() {
+            self.status =
+                "Preview results are binned — run the full correction before exporting.".to_owned();
+            return;
+        }
         let input_dir_name = self
             .input_dir
             .as_ref()
@@ -506,12 +674,24 @@ impl DehydrationApp {
         let Some(output_dir) = dialog.pick_folder() else {
             return;
         };
+        let (h, w) = result.dims();
+        let provenance = Provenance {
+            input_folder: self.input_dir.clone().unwrap_or_default(),
+            num_images: result.frames.len(),
+            image_width: w,
+            image_height: h,
+            params: result.params,
+            subspace_dimension: result.subspace_dimension,
+            bin: result.bin,
+            elapsed_seconds: result.elapsed_seconds,
+        };
         let rx = start_export(
             output_dir,
             input_dir_name,
             result.frames.clone(),
             stack.sources.clone(),
             stack.transposed_on_load,
+            provenance,
             ctx.clone(),
         );
         self.export_job = Some(ExportJob {
@@ -520,6 +700,39 @@ impl DehydrationApp {
             total: result.frames.len(),
         });
         self.status = "Exporting corrected images…".to_owned();
+    }
+
+    /// Save the region profiles (plus TOF/λ columns when available) as CSV.
+    fn save_profiles_csv(&mut self) {
+        let Some((uncorrected, corrected)) = self.profiles.clone() else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("profiles.csv")
+            .set_title("Save the region profiles as CSV");
+        if let Some(dir) = &self.input_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        let tof = self.spectra_tof_us.clone();
+        let lambda: Option<Vec<f64>> = tof.as_ref().map(|tof| {
+            tof.iter()
+                .map(|&t| spectra::tof_us_to_lambda_angstroms(t, self.distance_m))
+                .collect()
+        });
+        match crate::export::write_profiles_csv(
+            &path,
+            &uncorrected,
+            &corrected,
+            tof.as_deref(),
+            lambda.as_deref(),
+        ) {
+            Ok(()) => self.status = format!("Profiles saved to {}", path.display()),
+            Err(e) => self.status = format!("CSV save failed: {e:#}"),
+        }
     }
 
     fn poll_export(&mut self) {
@@ -554,55 +767,124 @@ impl DehydrationApp {
         }
         self.profiles_dirty = false;
         self.profiles = None;
-        let (Some(stack), Some(result), Some(region)) =
-            (&self.stack, &self.result, self.region)
-        else {
+        self.pixel_profiles = None;
+        let (Some(stack), Some(result)) = (&self.stack, &self.result) else {
             return;
         };
-        let r = region.clamped(stack.width, stack.height);
-        let mean_of = |frame: &Array2<f32>| -> f64 {
-            frame
-                .slice(s![r.top..r.bottom, r.left..r.right])
-                .mapv(f64::from)
-                .mean()
-                .unwrap_or(0.0)
-        };
-        let uncorrected: Vec<f64> = stack.frames.iter().map(mean_of).collect();
-        let corrected: Vec<f64> = result.frames.iter().map(mean_of).collect();
-        self.profiles = Some((uncorrected, corrected));
+        let (h, w) = result.dims();
+        let n = result.frames.len();
+
+        if let Some(region) = self.region {
+            let r = region.clamped(w, h);
+            let mean_of = |frame: &Array2<f32>| -> f64 {
+                frame
+                    .slice(s![r.top..r.bottom, r.left..r.right])
+                    .mapv(f64::from)
+                    .mean()
+                    .unwrap_or(0.0)
+            };
+            let uncorrected: Vec<f64> = (0..n)
+                .filter_map(|i| result.raw_frame(stack, i))
+                .map(mean_of)
+                .collect();
+            let corrected: Vec<f64> = result.frames.iter().map(mean_of).collect();
+            self.profiles = Some((uncorrected, corrected));
+        }
+
+        if let Some((py, px)) = self.pixel_marker {
+            if py < h && px < w {
+                let uncorrected: Vec<f64> = (0..n)
+                    .filter_map(|i| result.raw_frame(stack, i))
+                    .map(|f| f64::from(f[(py, px)]))
+                    .collect();
+                let corrected: Vec<f64> = result
+                    .frames
+                    .iter()
+                    .map(|f| f64::from(f[(py, px)]))
+                    .collect();
+                self.pixel_profiles = Some((uncorrected, corrected));
+            }
+        }
+    }
+
+    /// X-axis values for the profile plots, per the selected axis.
+    fn x_values(&self, n: usize) -> Vec<f64> {
+        match (self.x_axis, &self.spectra_tof_us) {
+            (XAxis::TofUs, Some(tof)) => tof.iter().take(n).copied().collect(),
+            (XAxis::LambdaAngstrom, Some(tof)) => tof
+                .iter()
+                .take(n)
+                .map(|&t| spectra::tof_us_to_lambda_angstroms(t, self.distance_m))
+                .collect(),
+            _ => (0..n).map(|i| i as f64).collect(),
+        }
     }
 
     // ----- textures ----------------------------------------------------------
 
-    /// The images of the current view: `(left, right)` — right is `None` in
-    /// the Profiles view (the plot takes its place).
-    fn current_images(&self) -> (Option<&Array2<f32>>, Option<&Array2<f32>>) {
+    /// The images of the current view as owned copies: `(left, right,
+    /// right_is_difference)` — right is `None` in the Profiles view (the
+    /// plot takes its place).
+    fn display_images(&self) -> (Option<Array2<f32>>, Option<Array2<f32>>, bool) {
         match self.view {
             View::Raw => (
-                self.stack.as_ref().and_then(|s| s.frames.get(self.frame_idx)),
-                self.integrated_raw.as_ref(),
-            ),
-            View::Result => (
-                self.result
+                self.stack
                     .as_ref()
-                    .and_then(|r| r.frames.get(self.frame_idx)),
-                self.stack.as_ref().and_then(|s| s.frames.get(self.frame_idx)),
+                    .and_then(|s| s.frames.get(self.frame_idx))
+                    .cloned(),
+                self.integrated_raw.clone(),
+                false,
             ),
-            View::Profiles => (self.result.as_ref().map(|r| &r.integrated_mean), None),
+            View::Result => {
+                let (Some(stack), Some(result)) = (&self.stack, &self.result) else {
+                    return (None, None, false);
+                };
+                let corrected = result.frames.get(self.frame_idx).cloned();
+                let raw = result.raw_frame(stack, self.frame_idx).cloned();
+                match self.right_pane {
+                    RightPane::Raw => (corrected, raw, false),
+                    RightPane::Difference => {
+                        let diff = match (&corrected, &raw) {
+                            (Some(c), Some(r)) if c.dim() == r.dim() => Some(c - r),
+                            _ => None,
+                        };
+                        (corrected, diff, true)
+                    }
+                }
+            }
+            View::Profiles => (
+                self.result.as_ref().map(|r| r.integrated_mean.clone()),
+                None,
+                false,
+            ),
         }
     }
 
     fn pane_titles(&self) -> (String, String) {
+        let preview = self
+            .result
+            .as_ref()
+            .filter(|r| r.is_preview())
+            .map(|r| format!("  [PREVIEW {0}×{0} binned]", r.bin))
+            .unwrap_or_default();
         match self.view {
             View::Raw => (
                 format!("Raw image #{}", self.frame_idx),
                 "Integrated image (sum)".to_owned(),
             ),
             View::Result => (
-                format!("Corrected image #{}", self.frame_idx),
-                format!("Uncorrected image #{}", self.frame_idx),
+                format!("Corrected image #{}{preview}", self.frame_idx),
+                match self.right_pane {
+                    RightPane::Raw => format!("Uncorrected image #{}{preview}", self.frame_idx),
+                    RightPane::Difference => {
+                        format!("Corrected − raw #{}{preview}", self.frame_idx)
+                    }
+                },
             ),
-            View::Profiles => ("Integrated corrected image (mean)".to_owned(), String::new()),
+            View::Profiles => (
+                format!("Integrated corrected image (mean){preview}"),
+                String::new(),
+            ),
         }
     }
 
@@ -612,28 +894,10 @@ impl DehydrationApp {
         }
         let lut = self.colormap.lut();
 
-        // Contrast range follows the left image while on auto. Compute the
-        // color images (owned) before touching any field, so the immutable
-        // borrow of the source images ends first.
-        let (left_color, right_color, range) = {
-            let (left, right) = self.current_images();
-            let range = left.map(finite_range);
-            let (vmin, vmax) = match range {
-                Some((lo, hi)) if self.contrast_auto => (lo, hi),
-                _ => (self.vmin, self.vmax),
-            };
-            let left_color = left.map(|img| colorize(img, vmin, vmax, &lut));
-            let right_color = right.map(|img| {
-                // Raw view: the integrated image has its own scale; Result
-                // view: corrected and uncorrected share the contrast.
-                let (lo, hi) = match self.view {
-                    View::Raw => finite_range(img),
-                    _ => (vmin, vmax),
-                };
-                colorize(img, lo, hi, &lut)
-            });
-            (left_color, right_color, range)
-        };
+        let (left, right, right_is_diff) = self.display_images();
+
+        // Contrast range follows the left image while on auto.
+        let range = left.as_ref().map(finite_range);
         if let Some((lo, hi)) = range {
             self.data_min = lo;
             self.data_max = hi;
@@ -642,6 +906,26 @@ impl DehydrationApp {
                 self.vmax = hi;
             }
         }
+        let (vmin, vmax) = (self.vmin, self.vmax);
+        let left_color = left.as_ref().map(|img| colorize(img, vmin, vmax, &lut));
+        let right_color = right.as_ref().map(|img| {
+            let (lo, hi) = if right_is_diff {
+                // Symmetric range around 0: structure in the difference
+                // stands out regardless of sign.
+                let (lo, hi) = finite_range(img);
+                let a = lo.abs().max(hi.abs()).max(1e-12);
+                (-a, a)
+            } else {
+                match self.view {
+                    // Raw view: the integrated image has its own scale;
+                    // Result view: corrected and raw share the contrast.
+                    View::Raw => finite_range(img),
+                    _ => (vmin, vmax),
+                }
+            };
+            colorize(img, lo, hi, &lut)
+        });
+        self.pane_cache = (left, right);
 
         self.tex_left =
             left_color.map(|c| ctx.load_texture("pane_left", c, TextureOptions::NEAREST));
@@ -782,6 +1066,21 @@ impl DehydrationApp {
                     .changed();
             });
 
+            if self.view == View::Result {
+                ui.separator();
+                ui.label("vs:");
+                changed |= ui
+                    .selectable_value(&mut self.right_pane, RightPane::Raw, "Raw")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut self.right_pane, RightPane::Difference, "Difference")
+                    .on_hover_text(
+                        "corrected − raw on a symmetric color range: structure here is \
+                         what the correction removed (or invented)",
+                    )
+                    .changed();
+            }
+
             let n_frames = self.stack.as_ref().map(|s| s.n_frames()).unwrap_or(0);
             if matches!(self.view, View::Raw | View::Result) && n_frames > 1 {
                 ui.separator();
@@ -882,6 +1181,15 @@ impl DehydrationApp {
                 // (points × bands) f64 working matrix + f32 corrected stack
                 fmt_bytes(n as u64 * (h * w) as u64 * 12),
             ));
+            if stack.nonfinite_fixed > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "{} NaN/Inf pixel(s) replaced by 0 on load",
+                        stack.nonfinite_fixed
+                    ),
+                );
+            }
             if let (Some(first), Some(last)) = (stack.sources.first(), stack.sources.last()) {
                 let name = |p: &std::path::Path| {
                     p.file_name()
@@ -915,11 +1223,27 @@ impl DehydrationApp {
                 .on_hover_text("Pick 'transmission' when the images are normalized transmission data");
             ui.add_space(6.0);
 
-            ui.add(
-                egui::Slider::new(&mut self.params.num_materials, 1..=10)
-                    .text("Number of materials"),
-            )
-            .on_hover_text("How many different materials the data set contains");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.params.num_materials, 1..=10)
+                        .text("Number of materials"),
+                )
+                .on_hover_text("How many different materials the data set contains");
+                let estimating = self.estimate_job.is_some();
+                let ctx = ui.ctx().clone();
+                if estimating {
+                    ui.spinner();
+                } else if ui
+                    .add_enabled(self.stack.is_some(), egui::Button::new("Auto"))
+                    .on_hover_text(
+                        "Estimate from the data: fits a noise model to the singular values \
+                         of sampled pixel spectra and counts the ones above it",
+                    )
+                    .clicked()
+                {
+                    self.start_estimation(&ctx);
+                }
+            });
 
             egui::ComboBox::from_label("Beta loss")
                 .selected_text(self.params.beta_loss.label())
@@ -946,19 +1270,38 @@ impl DehydrationApp {
             }
         } else {
             let can_run = self.stack.is_some() && self.loading.is_none();
-            if ui
-                .add_enabled(can_run, egui::Button::new("▶ Perform correction"))
-                .on_hover_text("Runs the NMF dehydration/hydration denoising on the whole stack")
-                .clicked()
-            {
-                self.start_correction_job(&ctx);
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_run, egui::Button::new("▶ Perform correction"))
+                    .on_hover_text(
+                        "Runs the NMF dehydration/hydration denoising on the whole stack",
+                    )
+                    .clicked()
+                {
+                    self.start_correction_job(&ctx, 1);
+                }
+                if ui
+                    .add_enabled(can_run, egui::Button::new("⚡ Preview"))
+                    .on_hover_text(format!(
+                        "Fast preview on {PREVIEW_BIN}×{PREVIEW_BIN}-binned pixels (~{}× \
+                         faster) for parameter tuning; previews cannot be exported",
+                        PREVIEW_BIN * PREVIEW_BIN
+                    ))
+                    .clicked()
+                {
+                    self.start_correction_job(&ctx, PREVIEW_BIN);
+                }
+            });
         }
 
         if let Some(result) = &self.result {
             ui.add_space(10.0);
             ui.separator();
-            ui.heading("Result");
+            if result.is_preview() {
+                ui.heading(format!("Result — PREVIEW ({0}×{0} binned)", result.bin));
+            } else {
+                ui.heading("Result");
+            }
             ui.label(format!(
                 "{} materials → subspace dimension {}",
                 result.params.num_materials, result.subspace_dimension
@@ -989,15 +1332,22 @@ impl DehydrationApp {
                         .show_percentage()
                         .text(format!("Exporting {} / {}", job.done, job.total)),
                 );
-            } else if ui
-                .button("💾 Export corrected images…")
-                .on_hover_text(
-                    "Choose an output folder; the corrected stack is written as \
-                     32-bit float TIFFs into a new subfolder named after the input folder",
-                )
-                .clicked()
-            {
-                self.export_dialog(&ctx);
+            } else {
+                let exportable = !result.is_preview();
+                if ui
+                    .add_enabled(exportable, egui::Button::new("💾 Export corrected images…"))
+                    .on_hover_text(
+                        "Choose an output folder; the corrected stack is written as \
+                         32-bit float TIFFs (plus correction_config.json recording the \
+                         parameters) into a new subfolder named after the input folder",
+                    )
+                    .on_disabled_hover_text(
+                        "Preview results are binned — run the full correction to export",
+                    )
+                    .clicked()
+                {
+                    self.export_dialog(&ctx);
+                }
             }
             if let Some(folder) = &self.last_export {
                 ui.add_space(4.0);
@@ -1061,10 +1411,13 @@ impl DehydrationApp {
         }
     }
 
-    /// Two images side by side (raw + integrated, or corrected + raw) with a
-    /// shared zoom and the colorbar of the contrast-controlled left pane.
+    /// Two images side by side (raw + integrated, or corrected + raw /
+    /// difference) with a shared zoom and the colorbar of the
+    /// contrast-controlled left pane.
     fn dual_viewer(&mut self, ui: &mut egui::Ui) {
-        let Some((h, w)) = self.stack.as_ref().map(|s| (s.height, s.width)) else {
+        // Dimensions come from the displayed image, not the stack: preview
+        // results are spatially binned.
+        let Some((h, w)) = self.pane_cache.0.as_ref().map(|img| img.dim()) else {
             return;
         };
         let (title_left, title_right) = self.pane_titles();
@@ -1085,6 +1438,10 @@ impl DehydrationApp {
                 self.fit_requested = false;
             }
 
+            let panes = [
+                (self.tex_left.clone(), self.pane_cache.0.clone()),
+                (self.tex_right.clone(), self.pane_cache.1.clone()),
+            ];
             ui.allocate_ui(egui::vec2(view_w, avail.y), |ui| {
                 ui.set_min_size(egui::vec2(view_w, avail.y));
                 egui::ScrollArea::both()
@@ -1093,10 +1450,7 @@ impl DehydrationApp {
                         ui.horizontal_top(|ui| {
                             let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
                             let mut cursor = None;
-                            for (tex, img) in [
-                                (self.tex_left.clone(), self.current_images().0),
-                                (self.tex_right.clone(), self.current_images().1),
-                            ] {
+                            for (tex, img) in &panes {
                                 let Some(tex) = tex else { continue };
                                 let (rect, response) =
                                     ui.allocate_exact_size(size, Sense::hover());
@@ -1133,7 +1487,7 @@ impl DehydrationApp {
     /// Profiles view: the integrated corrected image with a draggable region
     /// on the left, the region's mean-intensity profiles on the right.
     fn profiles_view(&mut self, ui: &mut egui::Ui) {
-        let Some((h, w)) = self.stack.as_ref().map(|s| (s.height, s.width)) else {
+        let Some((h, w)) = self.result.as_ref().map(|r| r.dims()) else {
             return;
         };
         let (title_left, _) = self.pane_titles();
@@ -1146,7 +1500,10 @@ impl DehydrationApp {
             ui.vertical(|ui| {
                 ui.set_max_width(img_w);
                 ui.label(egui::RichText::new(title_left).strong());
-                ui.label("Drag to draw the region, drag inside it to move it, drag a handle to resize it.");
+                ui.label(
+                    "Drag to draw the region, drag inside it to move it, drag a handle to \
+                     resize it. Click a pixel to plot its spectrum.",
+                );
                 if self.fit_requested && w > 0 && h > 0 {
                     let s = (img_w / w as f32).min((avail.y - 60.0).max(50.0) / h as f32);
                     self.scale = s.clamp(0.02, 64.0);
@@ -1186,7 +1543,7 @@ impl DehydrationApp {
                 ui.horizontal(|ui| {
                     if let Some(region) = self.region {
                         ui.label(format!(
-                            "Profiles for region (rows {}:{}, columns {}:{})",
+                            "Region (rows {}:{}, columns {}:{})",
                             region.top, region.bottom, region.left, region.right
                         ));
                         ui.separator();
@@ -1195,23 +1552,77 @@ impl DehydrationApp {
                     ui.selectable_value(&mut self.log_y, false, "Linear");
                     ui.selectable_value(&mut self.log_y, true, "Log")
                         .on_hover_text("log₁₀ scale; non-positive values are hidden");
+                    ui.separator();
+                    if ui
+                        .add_enabled(self.profiles.is_some(), egui::Button::new("📄 Save CSV…"))
+                        .on_hover_text(
+                            "Write the plotted profiles (with TOF/wavelength columns when \
+                             a Spectra.txt was found) to a CSV file",
+                        )
+                        .clicked()
+                    {
+                        self.save_profiles_csv();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("X-axis:");
+                    ui.selectable_value(&mut self.x_axis, XAxis::Index, "Image index");
+                    ui.add_enabled_ui(self.spectra_tof_us.is_some(), |ui| {
+                        ui.selectable_value(&mut self.x_axis, XAxis::TofUs, "TOF (µs)")
+                            .on_disabled_hover_text("No *_Spectra.txt found next to the images");
+                        ui.selectable_value(
+                            &mut self.x_axis,
+                            XAxis::LambdaAngstrom,
+                            "Wavelength (Å)",
+                        )
+                        .on_disabled_hover_text("No *_Spectra.txt found next to the images");
+                    });
+                    if self.x_axis == XAxis::LambdaAngstrom {
+                        ui.label("L (m):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.distance_m)
+                                .speed(0.01)
+                                .range(0.1..=100.0),
+                        )
+                        .on_hover_text("Source–detector distance for λ = h·t/(mₙ·L)");
+                    }
+                    if let Some((py, px)) = self.pixel_marker {
+                        ui.separator();
+                        ui.label(format!("Pixel ({px}, {py})"));
+                        if ui.small_button("✖").on_hover_text("Remove the pixel marker").clicked()
+                        {
+                            self.pixel_marker = None;
+                            self.pixel_profiles = None;
+                        }
+                    }
                 });
                 if let Some((uncorrected, corrected)) = &self.profiles {
                     // In log mode the plotted values are log10(y); the axis
                     // ticks and the cursor read-out convert back.
                     let log_y = self.log_y;
+                    let xs = self.x_values(uncorrected.len().max(corrected.len()));
                     let series = |vals: &[f64]| -> PlotPoints {
                         vals.iter()
                             .enumerate()
                             .filter(|&(_, &v)| !log_y || v > 0.0)
-                            .map(|(i, &v)| [i as f64, if log_y { v.log10() } else { v }])
+                            .map(|(i, &v)| {
+                                [
+                                    xs.get(i).copied().unwrap_or(i as f64),
+                                    if log_y { v.log10() } else { v },
+                                ]
+                            })
                             .collect()
                     };
                     let uncorr = series(uncorrected);
                     let corr = series(corrected);
-                    let mut plot = Plot::new(("profiles_plot", log_y))
+                    let pixel_series = self
+                        .pixel_profiles
+                        .as_ref()
+                        .map(|(u, c)| (series(u), series(c)));
+                    let x_axis = self.x_axis;
+                    let mut plot = Plot::new(("profiles_plot", log_y, x_axis.label()))
                         .legend(Legend::default())
-                        .x_axis_label("Image index")
+                        .x_axis_label(x_axis.label())
                         .y_axis_label(if log_y {
                             "Average intensity (log)"
                         } else {
@@ -1221,7 +1632,12 @@ impl DehydrationApp {
                             Corner::LeftBottom,
                             CoordinatesFormatter::new(move |p, _| {
                                 let y = if log_y { 10f64.powf(p.y) } else { p.y };
-                                format!("image {:.0}  —  intensity {y:.5}", p.x)
+                                let x = match x_axis {
+                                    XAxis::Index => format!("image {:.0}", p.x),
+                                    XAxis::TofUs => format!("{:.2} µs", p.x),
+                                    XAxis::LambdaAngstrom => format!("{:.4} Å", p.x),
+                                };
+                                format!("{x}  —  intensity {y:.5}")
                             }),
                         );
                     if log_y {
@@ -1239,6 +1655,18 @@ impl DehydrationApp {
                                 .shape(MarkerShape::Circle)
                                 .radius(2.5),
                         );
+                        if let Some((pu, pc)) = pixel_series {
+                            plot_ui.points(
+                                Points::new("Pixel uncorrected", pu)
+                                    .shape(MarkerShape::Asterisk)
+                                    .radius(2.0),
+                            );
+                            plot_ui.points(
+                                Points::new("Pixel corrected", pc)
+                                    .shape(MarkerShape::Diamond)
+                                    .radius(2.0),
+                            );
+                        }
                     });
                 }
             });
@@ -1279,6 +1707,23 @@ impl DehydrationApp {
         let to_screen = |ix: f32, iy: f32| -> Pos2 {
             Pos2::new(rect.left() + ix * scale, rect.top() + iy * scale)
         };
+
+        // Plain click (no drag): mark the pixel whose spectrum to plot.
+        if response.clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let (ix, iy) = to_img(p);
+                let (xi, yi) = (ix.floor() as i64, iy.floor() as i64);
+                if xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h {
+                    let new = (yi as usize, xi as usize);
+                    self.pixel_marker = if self.pixel_marker == Some(new) {
+                        None // clicking the marked pixel clears it
+                    } else {
+                        Some(new)
+                    };
+                    self.profiles_dirty = true;
+                }
+            }
+        }
 
         // A drag starts on a handle (resize), inside the region (move), or
         // anywhere else (draw a new region).
@@ -1420,6 +1865,19 @@ impl DehydrationApp {
                 );
             }
         }
+
+        // Crosshair on the marked pixel.
+        if let Some((py, px)) = self.pixel_marker {
+            let c = to_screen(px as f32 + 0.5, py as f32 + 0.5);
+            let arm = 7.0;
+            for (a, b) in [
+                (Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)),
+                (Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)),
+            ] {
+                painter.line_segment([a, b], Stroke::new(3.0, Color32::BLACK));
+                painter.line_segment([a, b], Stroke::new(1.5, Color32::YELLOW));
+            }
+        }
     }
 
     /// Vertical colorbar for the current contrast range (left pane).
@@ -1559,7 +2017,12 @@ impl eframe::App for DehydrationApp {
         self.poll_load();
         self.poll_correction();
         self.poll_export();
-        if self.loading.is_some() || self.corr_job.is_some() || self.export_job.is_some() {
+        self.poll_estimation();
+        if self.loading.is_some()
+            || self.corr_job.is_some()
+            || self.export_job.is_some()
+            || self.estimate_job.is_some()
+        {
             ctx.request_repaint();
         }
         self.recompute_profiles();

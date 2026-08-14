@@ -26,6 +26,9 @@ pub struct ImageStack {
     /// it aligns with the input files as they are on disk; `.npy` input is
     /// loaded as-is, so its masks must not be.
     pub transposed_on_load: bool,
+    /// Number of NaN/Inf pixels replaced by 0 on load (dead detector pixels
+    /// would otherwise poison the NMF factorization).
+    pub nonfinite_fixed: usize,
 }
 
 impl ImageStack {
@@ -49,12 +52,17 @@ pub fn load_paths(paths: &[PathBuf]) -> Result<ImageStack> {
     load_paths_with_progress(paths, |_, _| {})
 }
 
-/// Like [`load_paths`], but invokes `on_progress(files_done, files_total)` after
-/// each input file is read, so a caller can drive a progress bar.
-pub fn load_paths_with_progress<F>(paths: &[PathBuf], mut on_progress: F) -> Result<ImageStack>
+/// Like [`load_paths`], but invokes `on_progress(files_done, files_total)` as
+/// input files finish, so a caller can drive a progress bar. Files are
+/// decoded in parallel (order of the resulting frames still follows the
+/// sorted file order); the callback runs on worker threads.
+pub fn load_paths_with_progress<F>(paths: &[PathBuf], on_progress: F) -> Result<ImageStack>
 where
-    F: FnMut(usize, usize),
+    F: Fn(usize, usize) + Sync,
 {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     if paths.is_empty() {
         bail!("No files selected");
     }
@@ -62,23 +70,52 @@ where
     let mut sorted = paths.to_vec();
     sorted.sort();
     let total = sorted.len();
+    let done = AtomicUsize::new(0);
+
+    struct FileLoad {
+        frames: Vec<Array2<f32>>,
+        transposed: bool,
+        nonfinite: usize,
+    }
+
+    let per_file: Vec<FileLoad> = sorted
+        .par_iter()
+        .map(|path| {
+            let (mut frames, transposed) = match ext_of(path).as_str() {
+                "tif" | "tiff" => (load_tiff(path)?, true),
+                "npy" => (load_npy(path)?, false),
+                other => bail!("Unsupported file type '.{other}': {}", path.display()),
+            };
+            // Sanitize NaN/Inf (dead pixels) to 0 so they cannot poison the
+            // correction, counting them for the UI.
+            let mut nonfinite = 0usize;
+            for frame in &mut frames {
+                for v in frame.iter_mut() {
+                    if !v.is_finite() {
+                        *v = 0.0;
+                        nonfinite += 1;
+                    }
+                }
+            }
+            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+            Ok(FileLoad {
+                frames,
+                transposed,
+                nonfinite,
+            })
+        })
+        .collect::<Result<_>>()?;
 
     let mut frames: Vec<Array2<f32>> = Vec::new();
     let mut sources: Vec<PathBuf> = Vec::new();
     let mut dims: Option<(usize, usize)> = None;
     let mut transposed_on_load = false;
+    let mut nonfinite_fixed = 0usize;
 
-    for (idx, path) in sorted.iter().enumerate() {
-        let loaded = match ext_of(path).as_str() {
-            "tif" | "tiff" => {
-                transposed_on_load = true;
-                load_tiff(path)?
-            }
-            "npy" => load_npy(path)?,
-            other => bail!("Unsupported file type '.{other}': {}", path.display()),
-        };
-
-        for frame in loaded {
+    for (path, loaded) in sorted.iter().zip(per_file) {
+        transposed_on_load |= loaded.transposed;
+        nonfinite_fixed += loaded.nonfinite;
+        for frame in loaded.frames {
             let (h, w) = (frame.shape()[0], frame.shape()[1]);
             match dims {
                 None => dims = Some((h, w)),
@@ -97,7 +134,6 @@ where
             frames.push(frame);
             sources.push(path.clone());
         }
-        on_progress(idx + 1, total);
     }
 
     let (height, width) = dims.ok_or_else(|| anyhow!("No frames were loaded"))?;
@@ -107,6 +143,7 @@ where
         height,
         sources,
         transposed_on_load,
+        nonfinite_fixed,
     })
 }
 
@@ -285,6 +322,23 @@ mod tests {
         assert_eq!(stack.n_frames(), 1);
         assert_eq!((stack.height, stack.width), (3, 4));
         assert_eq!(stack.frames[0][(2, 3)], 11.0);
+    }
+
+    #[test]
+    fn nan_and_inf_pixels_are_zeroed_and_counted() {
+        let dir = tmp_dir("nan");
+        let path = dir.join("img.npy");
+        let mut a = ndarray::Array2::<f64>::zeros((2, 3));
+        a[(0, 0)] = f64::NAN;
+        a[(1, 2)] = f64::INFINITY;
+        a[(0, 1)] = 5.0;
+        ndarray_npy::write_npy(&path, &a).unwrap();
+
+        let stack = load_paths(&[path]).unwrap();
+        assert_eq!(stack.nonfinite_fixed, 2);
+        assert_eq!(stack.frames[0][(0, 0)], 0.0);
+        assert_eq!(stack.frames[0][(1, 2)], 0.0);
+        assert_eq!(stack.frames[0][(0, 1)], 5.0);
     }
 
     #[test]
