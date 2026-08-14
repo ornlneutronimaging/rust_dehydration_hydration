@@ -32,9 +32,11 @@ const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
 /// ORNL Neutron Imaging team logo (same asset as the other rust
 /// applications) and the MBIRJAX logo (the Purdue library the correction is
 /// a port of), embedded in the binary and shown at the bottom-left of the
-/// window.
+/// window. The MBIRJAX logo has a light- and a dark-background variant;
+/// the one matching the active theme is displayed.
 const IMAGING_LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
-const MBIRJAX_LOGO_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.jpeg");
+const MBIRJAX_LOGO_LIGHT_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.jpeg");
+const MBIRJAX_LOGO_DARK_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo_dark_background.png");
 const LOGO_HEIGHT: f32 = 44.0;
 
 fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
@@ -204,8 +206,9 @@ pub struct DehydrationApp {
     status: String,
     /// The "ℹ mbirjax" About dialog (algorithm provenance and versions).
     show_about: bool,
-    /// (imaging, mbirjax) logo textures, loaded on the first frame.
-    logo_tex: Option<(Option<TextureHandle>, Option<TextureHandle>)>,
+    /// (imaging, mbirjax-light-bg, mbirjax-dark-bg) logo textures, loaded on
+    /// the first frame.
+    logo_tex: Option<[Option<TextureHandle>; 3]>,
 }
 
 impl Default for DehydrationApp {
@@ -253,35 +256,29 @@ impl DehydrationApp {
         }
     }
 
-    /// The two logos, side by side. The MBIRJAX wordmark is dark-on-white
-    /// (JPEG, no transparency), so it sits on a white rounded chip to look
-    /// intentional in the dark theme.
+    /// The two logos, side by side. The MBIRJAX variant matching the active
+    /// theme is shown (dark-on-white for light, white-on-black for dark).
     fn logos_row(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (imaging, mbirjax) = self.logo_tex.get_or_insert_with(|| {
-            (
+        let [imaging, mbirjax_light, mbirjax_dark] = self.logo_tex.get_or_insert_with(|| {
+            [
                 load_logo(&ctx, "imaging_logo", IMAGING_LOGO_BYTES),
-                load_logo(&ctx, "mbirjax_logo", MBIRJAX_LOGO_BYTES),
-            )
+                load_logo(&ctx, "mbirjax_logo_light", MBIRJAX_LOGO_LIGHT_BYTES),
+                load_logo(&ctx, "mbirjax_logo_dark", MBIRJAX_LOGO_DARK_BYTES),
+            ]
         });
+        let mbirjax = match ctx.theme() {
+            egui::Theme::Dark => mbirjax_dark,
+            egui::Theme::Light => mbirjax_light,
+        };
         ui.horizontal(|ui| {
             if let Some(tex) = imaging {
                 ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
                     .on_hover_text("Neutron Imaging — Oak Ridge National Laboratory");
             }
             if let Some(tex) = mbirjax {
-                egui::Frame::new()
-                    .fill(Color32::WHITE)
-                    .corner_radius(4)
-                    .inner_margin(2)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT - 8.0),
-                        )
-                        .on_hover_text(format!(
-                            "MBIRJAX {MBIRJAX_VERSION} — Purdue University"
-                        ));
-                    });
+                ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
+                    .on_hover_text(format!("MBIRJAX {MBIRJAX_VERSION} — Purdue University"));
             }
         });
     }
