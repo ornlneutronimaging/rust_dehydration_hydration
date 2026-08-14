@@ -143,6 +143,8 @@ pub struct DehydrationApp {
     /// Folder the images came from: names the export folder and seeds the
     /// export dialog location.
     input_dir: Option<PathBuf>,
+    /// Recently loaded dataset folders, most recent first (persisted).
+    recent: Vec<PathBuf>,
 
     view: View,
     frame_idx: usize,
@@ -199,6 +201,7 @@ impl DehydrationApp {
             stack: None,
             loading: None,
             input_dir: None,
+            recent: crate::recent::load(),
             view: View::Raw,
             frame_idx: 0,
             colormap: Colormap::Viridis,
@@ -337,6 +340,9 @@ impl DehydrationApp {
             .first()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
+        if let Some(dir) = &self.input_dir {
+            self.recent = crate::recent::add(dir);
+        }
 
         let mut acc = Array2::<f32>::zeros((h, w));
         for f in &stack.frames {
@@ -618,6 +624,37 @@ impl DehydrationApp {
         }
     }
 
+    /// The "🕒 Recent" drop-down: the last [`crate::recent::MAX_RECENT`]
+    /// dataset folders, most recent first. Folders that no longer exist are
+    /// shown disabled.
+    fn recent_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.set_min_width(280.0);
+        for dir in self.recent.clone() {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string());
+            let exists = dir.is_dir();
+            let label = if exists {
+                name
+            } else {
+                format!("{name}  (missing)")
+            };
+            if ui
+                .add_enabled(exists, egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend))
+                .on_hover_text(dir.display().to_string())
+                .on_disabled_hover_text(format!("{} no longer exists", dir.display()))
+                .clicked()
+            {
+                match loader::list_supported_in_dir(&dir) {
+                    Ok(files) => self.start_load(files, ctx),
+                    Err(e) => self.status = format!("{e:#}"),
+                }
+                ui.close();
+            }
+        }
+    }
+
     fn open_folder_dialog(&mut self, ctx: &egui::Context) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title("Open the folder containing the images to correct")
@@ -672,6 +709,11 @@ impl DehydrationApp {
             {
                 self.open_files_dialog(&ctx);
             }
+            ui.add_enabled_ui(!busy && !self.recent.is_empty(), |ui| {
+                ui.menu_button("🕒 Recent", |ui| {
+                    self.recent_menu(ui, &ctx);
+                });
+            });
 
             ui.separator();
 

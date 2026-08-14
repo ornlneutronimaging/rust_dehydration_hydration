@@ -13,4 +13,5 @@ pub mod hsnt;
 pub mod linalg;
 pub mod loader;
 pub mod nmf;
+pub mod recent;
 pub mod theme;

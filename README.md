@@ -18,6 +18,8 @@ Imaging*, vol. 11, pp. 663–677, 2025.
 
 1. **Open Folder…** — select the folder containing the TIFF images to correct
    (when the folder has none, its subfolders are searched, like the notebook).
+   The **🕒 Recent** menu reopens one of the last 5 dataset folders
+   (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).
 2. **Raw data** view — slide through the images next to the integrated (sum)
    image.
 3. **Correction parameters** (left panel):
