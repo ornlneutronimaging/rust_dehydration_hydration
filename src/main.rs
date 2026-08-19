@@ -36,6 +36,9 @@ OPTIONS:
   --max-iter <N>           NMF iteration cap (default 300)
   --bin <B>                Spatial binning factor (default 1 = full
                            resolution; >1 exports a binned preview)
+  -t, --offset <MICROSEC>  Detector offset: constant added to the TOF values
+                           of the spectra file (µs, default 0); shifts the
+                           TOF and wavelength axes of the profile plots
   -h, --help               Show this help
 
 The correction reproduces the dehydration_hydration notebook:
@@ -49,6 +52,7 @@ struct Cli {
     output: Option<PathBuf>,
     params: CorrectionParams,
     bin: usize,
+    offset_us: f64,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -58,6 +62,7 @@ fn parse_args() -> Result<Cli, String> {
         output: None,
         params: CorrectionParams::default(),
         bin: 1,
+        offset_us: 0.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -102,6 +107,15 @@ fn parse_args() -> Result<Cli, String> {
                     .map_err(|_| "--bin must be a positive integer".to_owned())?;
                 if cli.bin == 0 {
                     return Err("--bin must be at least 1".to_owned());
+                }
+            }
+            "-t" | "--offset" => {
+                let v = value("--offset")?;
+                cli.offset_us = v
+                    .parse()
+                    .map_err(|e| format!("invalid --offset '{v}': {e}"))?;
+                if !cli.offset_us.is_finite() {
+                    return Err(format!("--offset must be finite (got {})", cli.offset_us));
                 }
             }
             s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
@@ -219,6 +233,7 @@ fn main() -> eframe::Result<()> {
         }
     };
     let files = expand_inputs(&cli.inputs);
+    let offset_us = cli.offset_us;
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
@@ -243,6 +258,7 @@ fn main() -> eframe::Result<()> {
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(dehydration_hydration::theme::load());
             let mut app = DehydrationApp::new();
+            app.set_detector_offset(offset_us);
             if !files.is_empty() {
                 app.start_load(files, &cc.egui_ctx);
             }

@@ -266,6 +266,9 @@ pub struct DehydrationApp {
     x_axis: XAxis,
     /// Source–detector distance for the wavelength conversion (m).
     distance_m: f64,
+    /// Detector offset: constant added to the spectra file's TOF values, in µs
+    /// (also shifts the wavelength axis).
+    offset_us: f64,
 
     scale: f32,
     fit_requested: bool,
@@ -322,6 +325,7 @@ impl DehydrationApp {
             spectra_tof_us: None,
             x_axis: XAxis::Index,
             distance_m: spectra::DEFAULT_DISTANCE_M,
+            offset_us: 0.0,
             scale: 1.0,
             fit_requested: false,
             cursor: None,
@@ -329,6 +333,12 @@ impl DehydrationApp {
             show_about: false,
             logo_tex: None,
         }
+    }
+
+    /// Set the detector offset: a constant added to the spectra file's TOF
+    /// values, in µs (the `-t/--offset` command-line option).
+    pub fn set_detector_offset(&mut self, offset_us: f64) {
+        self.offset_us = offset_us;
     }
 
     /// The two logos, side by side. The MBIRJAX variant matching the active
@@ -717,7 +727,12 @@ impl DehydrationApp {
         let Some(path) = dialog.save_file() else {
             return;
         };
-        let tof = self.spectra_tof_us.clone();
+        // The detector offset is applied to the exported TOF column, so the
+        // CSV matches the plotted axes.
+        let tof: Option<Vec<f64>> = self
+            .spectra_tof_us
+            .as_ref()
+            .map(|tof| tof.iter().map(|&t| t + self.offset_us).collect());
         let lambda: Option<Vec<f64>> = tof.as_ref().map(|tof| {
             tof.iter()
                 .map(|&t| spectra::tof_us_to_lambda_angstroms(t, self.distance_m))
@@ -807,14 +822,20 @@ impl DehydrationApp {
         }
     }
 
-    /// X-axis values for the profile plots, per the selected axis.
+    /// X-axis values for the profile plots, per the selected axis. The
+    /// detector offset is added to the TOF values (and so shifts the
+    /// wavelength axis too).
     fn x_values(&self, n: usize) -> Vec<f64> {
         match (self.x_axis, &self.spectra_tof_us) {
-            (XAxis::TofUs, Some(tof)) => tof.iter().take(n).copied().collect(),
+            (XAxis::TofUs, Some(tof)) => {
+                tof.iter().take(n).map(|&t| t + self.offset_us).collect()
+            }
             (XAxis::LambdaAngstrom, Some(tof)) => tof
                 .iter()
                 .take(n)
-                .map(|&t| spectra::tof_us_to_lambda_angstroms(t, self.distance_m))
+                .map(|&t| {
+                    spectra::tof_us_to_lambda_angstroms(t + self.offset_us, self.distance_m)
+                })
                 .collect(),
             _ => (0..n).map(|i| i as f64).collect(),
         }
@@ -1586,6 +1607,18 @@ impl DehydrationApp {
                         )
                         .on_hover_text("Source–detector distance for λ = h·t/(mₙ·L)");
                     }
+                    if self.x_axis != XAxis::Index {
+                        ui.label("Detector offset:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.offset_us)
+                                .speed(0.5)
+                                .suffix(" µs"),
+                        )
+                        .on_hover_text(
+                            "Constant added to the TOF values of the spectra file \
+                             (also shifts the wavelength axis)",
+                        );
+                    }
                     if let Some((py, px)) = self.pixel_marker {
                         ui.separator();
                         ui.label(format!("Pixel ({px}, {py})"));
@@ -1726,9 +1759,16 @@ impl DehydrationApp {
         }
 
         // A drag starts on a handle (resize), inside the region (move), or
-        // anywhere else (draw a new region).
+        // anywhere else (draw a new region). Hit-test against the press
+        // origin, not the current pointer position: by the time egui reports
+        // drag_started the pointer has already moved past the drag threshold,
+        // and a fast drag on a handle would miss it and draw a new region.
         if response.drag_started() {
-            if let Some(sp) = response.interact_pointer_pos() {
+            let press = ui
+                .ctx()
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(sp) = press {
                 let p = to_img(sp);
                 let started = self.region.and_then(|r| {
                     let rectf = [

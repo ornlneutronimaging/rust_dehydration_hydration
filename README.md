@@ -52,9 +52,11 @@ Imaging*, vol. 11, pp. 663–677, 2025.
    pixel's spectrum to the plot. When a `*_Spectra.txt` sits next to the
    images, the x-axis can switch from image index to **TOF (µs)** or
    **wavelength (Å)** (λ = h·t/(mₙ·L), source–detector distance editable,
-   default 25 m). Linear/log y-axis toggle, cursor read-out in the plot
-   corner, and **📄 Save CSV…** writes the plotted profiles (with TOF/λ
-   columns when available).
+   default 25 m). A **detector offset** (µs, default 0, also settable with
+   `-t/--offset` as in rust_tiff_viewer) is added to the TOF values and
+   shifts the TOF and wavelength axes. Linear/log y-axis toggle, cursor
+   read-out in the plot corner, and **📄 Save CSV…** writes the plotted
+   profiles (with the offset applied to the TOF/λ columns when available).
 7. **💾 Export corrected images…** — pick an output folder; the corrected
    stack is written as 32-bit float TIFFs (input file names kept) into a new
    subfolder `<input-folder>_dehydration_hydration_corrected` (suffixed `_1`,
