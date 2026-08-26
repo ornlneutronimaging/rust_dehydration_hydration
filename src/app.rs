@@ -1367,7 +1367,7 @@ impl DehydrationApp {
                 }
             });
             ui.add(
-                egui::Slider::new(&mut self.params.safety_factor, 1.0..=32.0)
+                egui::Slider::new(&mut self.params.safety_factor, 1.0..=64.0)
                     .step_by(1.0)
                     .fixed_decimals(0)
                     .text("Safety factor"),
