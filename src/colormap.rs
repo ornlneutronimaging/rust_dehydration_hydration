@@ -6,7 +6,7 @@
 
 use colorgrad::Gradient;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Colormap {
     Gray,
     Viridis,

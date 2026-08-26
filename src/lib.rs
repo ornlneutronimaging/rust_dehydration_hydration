@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod colormap;
+pub mod config;
 pub mod correction;
 pub mod export;
 pub mod hsnt;

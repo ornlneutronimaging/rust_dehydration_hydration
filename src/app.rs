@@ -5,7 +5,7 @@
 //! dehydration_hydration notebook, in one native window.
 
 use crate::colormap::Colormap;
-use crate::correction::{start_correction, CorrectionMsg, CorrectionParams};
+use crate::correction::{start_correction, CorrectionMsg, CorrectionParams, MATERIALS_FACTOR};
 use crate::export::{start_export, ExportMsg, Provenance};
 use crate::hsnt::{estimate_num_materials, DatasetType, MBIRJAX_COMMIT, MBIRJAX_VERSION};
 use crate::loader::{self, ImageStack};
@@ -567,8 +567,8 @@ impl DehydrationApp {
             self.params.num_materials = estimate.clamp(1, 10);
             self.status = format!(
                 "Estimated {estimate} material(s) from {ESTIMATE_SAMPLE} sampled pixel spectra \
-                 (subspace dimension {}).",
-                (2 * estimate).min(20)
+                 (×{MATERIALS_FACTOR} → subspace dimension {}).",
+                self.params.to_hsnt().subspace_dimension()
             );
         }
     }
@@ -591,9 +591,11 @@ impl DehydrationApp {
             String::new()
         };
         self.status = format!(
-            "Correction running ({mode}{}, {} materials, {}, {} iterations max)…",
+            "Correction running ({mode}{}, {} materials ×{MATERIALS_FACTOR} → {}, {}, {} \
+             iterations max)…",
             self.params.dataset_type.label(),
             self.params.num_materials,
+            self.params.num_materials * MATERIALS_FACTOR,
             self.params.beta_loss.label(),
             self.params.max_iter,
         );
@@ -1023,6 +1025,83 @@ impl DehydrationApp {
         }
     }
 
+    // ----- config file (HDF5) -------------------------------------------------
+
+    /// The current settings as a [`crate::config::AppConfig`] snapshot.
+    fn current_config(&self) -> crate::config::AppConfig {
+        crate::config::AppConfig {
+            params: self.params,
+            distance_m: self.distance_m,
+            offset_us: self.offset_us,
+            colormap: self.colormap,
+            log_y: self.log_y,
+            contrast_auto: self.contrast_auto,
+            vmin: self.vmin,
+            vmax: self.vmax,
+            region: self
+                .region
+                .map(|r| [r.left, r.right, r.top, r.bottom]),
+            input_folder: self.input_dir.clone(),
+        }
+    }
+
+    /// Apply a loaded config: correction parameters, physical axis, display
+    /// settings, and profile region (clamped to the loaded stack, if any).
+    /// The recorded input folder is informational only — no data is loaded.
+    fn apply_config(&mut self, cfg: crate::config::AppConfig) {
+        self.params = cfg.params;
+        self.distance_m = cfg.distance_m;
+        self.offset_us = cfg.offset_us;
+        self.colormap = cfg.colormap;
+        self.log_y = cfg.log_y;
+        self.contrast_auto = cfg.contrast_auto;
+        if !cfg.contrast_auto {
+            self.vmin = cfg.vmin;
+            self.vmax = cfg.vmax;
+        }
+        if let Some([left, right, top, bottom]) = cfg.region {
+            let mut region = Region { left, right, top, bottom };
+            if let Some(stack) = &self.stack {
+                region = region.clamped(stack.width, stack.height);
+            }
+            self.region = Some(region);
+        }
+        self.tex_dirty = true;
+        self.profiles_dirty = true;
+    }
+
+    fn save_config_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save the current settings as an HDF5 config file")
+            .add_filter("HDF5 config", &["h5", "hdf5"])
+            .set_file_name("dehydration_hydration_config.h5");
+        if let Some(dir) = &self.input_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else { return };
+        match crate::config::save(&path, &self.current_config()) {
+            Ok(()) => self.status = format!("Settings saved to {}", path.display()),
+            Err(e) => self.status = format!("Saving the config failed: {e:#}"),
+        }
+    }
+
+    fn load_config_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Load settings from an HDF5 config file")
+            .add_filter("HDF5 config", &["h5", "hdf5"]);
+        if let Some(dir) = &self.input_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else { return };
+        match crate::config::load(&path) {
+            Ok(cfg) => {
+                self.apply_config(cfg);
+                self.status = format!("Settings loaded from {}", path.display());
+            }
+            Err(e) => self.status = format!("Loading the config failed: {e:#}"),
+        }
+    }
+
     // ----- UI: toolbar, parameters, status -----------------------------------
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1069,6 +1148,25 @@ impl DehydrationApp {
                 ui.menu_button("🕒 Recent", |ui| {
                     self.recent_menu(ui, &ctx);
                 });
+            });
+            ui.menu_button("⚙ Config", |ui| {
+                if ui
+                    .button("💾 Save settings to HDF5…")
+                    .on_hover_text(
+                        "Write the correction parameters, physical axis, display \
+                         settings, and profile region to a .h5 config file",
+                    )
+                    .clicked()
+                {
+                    self.save_config_dialog();
+                }
+                if ui
+                    .button("📂 Load settings from HDF5…")
+                    .on_hover_text("Apply the settings from a previously saved .h5 config file")
+                    .clicked()
+                {
+                    self.load_config_dialog();
+                }
             });
 
             ui.separator();
@@ -1249,7 +1347,10 @@ impl DehydrationApp {
                     egui::Slider::new(&mut self.params.num_materials, 1..=10)
                         .text("Number of materials"),
                 )
-                .on_hover_text("How many different materials the data set contains");
+                .on_hover_text(format!(
+                    "How many different materials the data set contains; the correction \
+                     receives ×{MATERIALS_FACTOR} this value to keep extra degrees of freedom"
+                ));
                 let estimating = self.estimate_job.is_some();
                 let ctx = ui.ctx().clone();
                 if estimating {
@@ -1265,6 +1366,26 @@ impl DehydrationApp {
                     self.start_estimation(&ctx);
                 }
             });
+            ui.add(
+                egui::Slider::new(&mut self.params.safety_factor, 1.0..=32.0)
+                    .step_by(1.0)
+                    .fixed_decimals(0)
+                    .text("Safety factor"),
+            )
+            .on_hover_text(
+                "Multiplier on the material count (after the ×4) giving the NMF \
+                 subspace dimension — larger keeps more degrees of freedom",
+            );
+            let subdim = self.params.to_hsnt().subspace_dimension();
+            let subdim = match &self.stack {
+                Some(s) => subdim.min(s.n_frames()).max(1),
+                None => subdim,
+            };
+            ui.weak(format!(
+                "×{MATERIALS_FACTOR} applied internally → {} passed to the correction \
+                 → subspace dimension {subdim}",
+                self.params.num_materials * MATERIALS_FACTOR
+            ));
 
             egui::ComboBox::from_label("Beta loss")
                 .selected_text(self.params.beta_loss.label())
@@ -1324,13 +1445,16 @@ impl DehydrationApp {
                 ui.heading("Result");
             }
             ui.label(format!(
-                "{} materials → subspace dimension {}",
-                result.params.num_materials, result.subspace_dimension
+                "{} materials (×{MATERIALS_FACTOR} → {}) → subspace dimension {}",
+                result.params.num_materials,
+                result.params.num_materials * MATERIALS_FACTOR,
+                result.subspace_dimension
             ));
             ui.label(format!(
-                "{} · {} · {} iterations max",
+                "{} · {} · safety factor {} · {} iterations max",
                 result.params.dataset_type.label(),
                 result.params.beta_loss.label(),
+                result.params.safety_factor,
                 result.params.max_iter
             ));
             ui.label(format!("Computed in {:.1} s", result.elapsed_seconds));

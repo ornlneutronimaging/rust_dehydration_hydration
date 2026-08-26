@@ -15,12 +15,22 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
+/// The user's "number of materials" is multiplied by this before it is
+/// handed to the correction, so the factorization keeps a comfortable
+/// number of degrees of freedom. Surfaced in the GUI, the CLI help and the
+/// provenance file — `num_materials` everywhere else stays the user's value.
+pub const MATERIALS_FACTOR: usize = 4;
+
 /// The user-facing parameters — the ones the notebook exposes. The rest of
 /// [`HsntParams`] keeps the notebook's defaults.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CorrectionParams {
     pub dataset_type: DatasetType,
     pub num_materials: usize,
+    /// Multiplier on the material count (after [`MATERIALS_FACTOR`]) giving
+    /// the NMF subspace dimension: `safety_factor × MATERIALS_FACTOR × N`,
+    /// capped at the number of images.
+    pub safety_factor: f64,
     pub beta_loss: BetaLoss,
     pub max_iter: usize,
 }
@@ -30,6 +40,7 @@ impl Default for CorrectionParams {
         Self {
             dataset_type: DatasetType::Attenuation,
             num_materials: 2,
+            safety_factor: 16.0,
             beta_loss: BetaLoss::Frobenius,
             max_iter: 300,
         }
@@ -40,7 +51,8 @@ impl CorrectionParams {
     pub fn to_hsnt(self) -> HsntParams {
         HsntParams {
             dataset_type: self.dataset_type,
-            num_materials: self.num_materials,
+            num_materials: self.num_materials * MATERIALS_FACTOR,
+            safety_factor: self.safety_factor,
             beta_loss: self.beta_loss,
             max_iter: self.max_iter,
             ..HsntParams::default()

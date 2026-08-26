@@ -9,6 +9,7 @@ anyhow = "1.0"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = "0.35"
 egui = "0.35"
+hdf5 = { package = "hdf5-metno", version = "0.14" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 egui_plot = "0.36"
 ndarray = { version = "0.17", features = ["rayon"] }

@@ -5,7 +5,7 @@
 //! GUI, for scripting and pipelines.
 
 use dehydration_hydration::app::DehydrationApp;
-use dehydration_hydration::correction::{run_correction, CorrectionParams};
+use dehydration_hydration::correction::{run_correction, CorrectionParams, MATERIALS_FACTOR};
 use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt::DatasetType;
 use dehydration_hydration::loader;
@@ -30,7 +30,10 @@ OPTIONS:
                            (requires INPUT and --output)
   -o, --output <DIR>       Folder receiving the corrected subfolder
                            '<input>_dehydration_hydration_corrected'
-  --materials <N>          Number of materials (default 2)
+  --materials <N>          Number of materials (default 2); the correction
+                           receives 4×N to keep extra degrees of freedom
+  --safety-factor <F>      Multiplier on the material count (after the ×4)
+                           giving the NMF subspace dimension (default 16)
   --dataset-type <TYPE>    attenuation | transmission (default attenuation)
   --beta-loss <LOSS>       frobenius | kullback-leibler (default frobenius)
   --max-iter <N>           NMF iteration cap (default 300)
@@ -82,6 +85,11 @@ fn parse_args() -> Result<Cli, String> {
                     .parse()
                     .map_err(|_| "--materials must be a positive integer".to_owned())?;
             }
+            "--safety-factor" | "--safety_factor" => {
+                cli.params.safety_factor = value("--safety-factor")?
+                    .parse()
+                    .map_err(|_| "--safety-factor must be a number".to_owned())?;
+            }
             "--dataset-type" | "--dataset_type" => {
                 cli.params.dataset_type = match value("--dataset-type")?.as_str() {
                     "attenuation" => DatasetType::Attenuation,
@@ -124,6 +132,9 @@ fn parse_args() -> Result<Cli, String> {
     }
     if cli.params.num_materials == 0 {
         return Err("--materials must be at least 1".to_owned());
+    }
+    if !cli.params.safety_factor.is_finite() || cli.params.safety_factor < 1.0 {
+        return Err("--safety-factor must be at least 1".to_owned());
     }
     if cli.run {
         if cli.inputs.is_empty() {
@@ -184,6 +195,13 @@ fn run_headless(cli: &Cli, files: Vec<PathBuf>) -> anyhow::Result<()> {
             last_stage = stage.to_owned();
         }
     };
+    eprintln!(
+        "Number of materials: {} (×{} → {} passed to the correction, safety factor {}).",
+        cli.params.num_materials,
+        MATERIALS_FACTOR,
+        cli.params.num_materials * MATERIALS_FACTOR,
+        cli.params.safety_factor
+    );
     let out = run_correction(&stack, cli.params, cli.bin, &cancel, &mut progress)?;
     eprintln!(
         "Correction done in {:.1} s (subspace dimension {}).",
