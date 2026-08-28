@@ -1551,16 +1551,26 @@ impl DehydrationApp {
             });
             return;
         }
-        match self.view {
-            View::Raw | View::Result => self.dual_viewer(ui),
-            View::Profiles => self.profiles_view(ui),
-        }
+        // The viewers adapt to the window, but their fixed parts (title rows,
+        // control rows, minimum viewport/plot sizes) can outgrow a short
+        // window (small displays, the large-text mode). The panel height is
+        // measured before entering the scroll area — inside it the available
+        // height is unbounded — and the minimum sizes in the viewers are what
+        // make the scroll bar appear.
+        let panel_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("central_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.view {
+                View::Raw | View::Result => self.dual_viewer(ui, panel_h),
+                View::Profiles => self.profiles_view(ui, panel_h),
+            });
     }
 
     /// Two images side by side (raw + integrated, or corrected + raw /
     /// difference) with a shared zoom and the colorbar of the
     /// contrast-controlled left pane.
-    fn dual_viewer(&mut self, ui: &mut egui::Ui) {
+    fn dual_viewer(&mut self, ui: &mut egui::Ui, panel_h: f32) {
         // Dimensions come from the displayed image, not the stack: preview
         // results are spatially binned.
         let Some((h, w)) = self.pane_cache.0.as_ref().map(|img| img.dim()) else {
@@ -1574,12 +1584,17 @@ impl DehydrationApp {
             ui.label(egui::RichText::new(title_right).strong());
         });
 
+        // Height left for the image panes: the measured panel height minus
+        // the title row, never below a usable viewport.
+        let view_h =
+            (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(160.0);
+
         ui.horizontal_top(|ui| {
             let avail = ui.available_size();
             let view_w = (avail.x - COLORBAR_WIDTH - ui.spacing().item_spacing.x).max(50.0);
             if self.fit_requested && w > 0 && h > 0 {
                 let gap = ui.spacing().item_spacing.x;
-                let s = ((view_w - gap) / (2.0 * w as f32)).min(avail.y / h as f32);
+                let s = ((view_w - gap) / (2.0 * w as f32)).min(view_h / h as f32);
                 self.scale = s.clamp(0.02, 64.0);
                 self.fit_requested = false;
             }
@@ -1588,8 +1603,8 @@ impl DehydrationApp {
                 (self.tex_left.clone(), self.pane_cache.0.clone()),
                 (self.tex_right.clone(), self.pane_cache.1.clone()),
             ];
-            ui.allocate_ui(egui::vec2(view_w, avail.y), |ui| {
-                ui.set_min_size(egui::vec2(view_w, avail.y));
+            ui.allocate_ui(egui::vec2(view_w, view_h), |ui| {
+                ui.set_min_size(egui::vec2(view_w, view_h));
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1626,17 +1641,22 @@ impl DehydrationApp {
                     });
             });
 
-            self.colorbar(ui, avail.y);
+            self.colorbar(ui, view_h);
         });
     }
 
     /// Profiles view: the integrated corrected image with a draggable region
     /// on the left, the region's mean-intensity profiles on the right.
-    fn profiles_view(&mut self, ui: &mut egui::Ui) {
+    fn profiles_view(&mut self, ui: &mut egui::Ui, panel_h: f32) {
         let Some((h, w)) = self.result.as_ref().map(|r| r.dims()) else {
             return;
         };
         let (title_left, _) = self.pane_titles();
+
+        // Height the two columns may use: the measured panel height (inside
+        // the scroll area the available height is unbounded), never below a
+        // usable minimum.
+        let body_h = (panel_h - ui.min_rect().height()).max(240.0);
 
         ui.horizontal_top(|ui| {
             let avail = ui.available_size();
@@ -1651,14 +1671,14 @@ impl DehydrationApp {
                      resize it. Click a pixel to plot its spectrum.",
                 );
                 if self.fit_requested && w > 0 && h > 0 {
-                    let s = (img_w / w as f32).min((avail.y - 60.0).max(50.0) / h as f32);
+                    let s = (img_w / w as f32).min((body_h - 60.0).max(50.0) / h as f32);
                     self.scale = s.clamp(0.02, 64.0);
                     self.fit_requested = false;
                 }
                 egui::ScrollArea::both()
                     .id_salt("profile_img")
                     .auto_shrink([false, false])
-                    .max_height(avail.y - 40.0)
+                    .max_height((body_h - 40.0).max(120.0))
                     .show(ui, |ui| {
                         self.profile_image(ui, w, h);
                     });
@@ -1755,6 +1775,14 @@ impl DehydrationApp {
                     }
                 });
                 if let Some((uncorrected, corrected)) = &self.profiles {
+                    // The plot gets the height left below the control rows:
+                    // inside the scroll area the available height is
+                    // unbounded, so it must be sized explicitly — and its
+                    // minimum is what makes the scroll bar appear.
+                    let plot_h = (body_h
+                        - ui.min_rect().height()
+                        - ui.spacing().item_spacing.y)
+                        .max(140.0);
                     // In log mode the plotted values are log10(y); the axis
                     // ticks and the cursor read-out convert back.
                     let log_y = self.log_y;
@@ -1779,6 +1807,7 @@ impl DehydrationApp {
                         .map(|(u, c)| (series(u), series(c)));
                     let x_axis = self.x_axis;
                     let mut plot = Plot::new(("profiles_plot", log_y, x_axis.label()))
+                        .height(plot_h)
                         .legend(Legend::default())
                         .x_axis_label(x_axis.label())
                         .y_axis_label(if log_y {
