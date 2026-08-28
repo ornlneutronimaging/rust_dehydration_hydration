@@ -1277,6 +1277,7 @@ impl DehydrationApp {
 
             ui.separator();
             crate::theme::toggle_button(ui);
+            crate::zoom::toggle_button(ui);
         });
     }
 

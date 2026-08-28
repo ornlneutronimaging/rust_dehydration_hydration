@@ -17,3 +17,4 @@ pub mod nmf;
 pub mod recent;
 pub mod spectra;
 pub mod theme;
+pub mod zoom;

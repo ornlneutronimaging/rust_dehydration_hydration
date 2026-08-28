@@ -275,6 +275,8 @@ fn main() -> eframe::Result<()> {
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(dehydration_hydration::theme::load());
+            cc.egui_ctx
+                .set_zoom_factor(dehydration_hydration::zoom::load());
             let mut app = DehydrationApp::new();
             app.set_detector_offset(offset_us);
             if !files.is_empty() {
