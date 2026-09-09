@@ -8,9 +8,12 @@
 //!
 //! Every frame is normalised to an `Array2<f32>` with shape `(height, width)`,
 //! row-major, so the rest of the program never has to care about the on-disk
-//! sample format.
+//! sample format. TIFF pages are re-oriented according to the detector that
+//! wrote them (see [`detector_orientation`]: Timepix transposed, CCD flipped
+//! vertically); `.npy` input is already-processed data and is loaded as-is.
 
 use anyhow::{anyhow, bail, Context, Result};
+pub use detector_orientation::{Detector, Orientation, Selection, Source};
 use ndarray::{Array2, Array3};
 use std::path::{Path, PathBuf};
 
@@ -21,11 +24,14 @@ pub struct ImageStack {
     pub height: usize,
     /// Source file for each frame (parallel to `frames`); useful for the UI.
     pub sources: Vec<PathBuf>,
-    /// Whether the frames were transposed on load (TIFF input — see
-    /// [`to_frame`]). A mask saved from this stack must be transposed back so
-    /// it aligns with the input files as they are on disk; `.npy` input is
-    /// loaded as-is, so its masks must not be.
-    pub transposed_on_load: bool,
+    /// Detector the stack was recorded with (automatic guess + user
+    /// override), which decides [`ImageStack::orientation`].
+    pub detector: Selection,
+    /// How the TIFF frames were re-oriented on load (see [`to_frame`]).
+    /// Frames written back to disk must be put back with
+    /// [`Orientation::undo`] so they align with the input files; `.npy`
+    /// input is loaded as-is, so its stacks carry [`Orientation::Identity`].
+    pub orientation: Orientation,
     /// Number of NaN/Inf pixels replaced by 0 on load (dead detector pixels
     /// would otherwise poison the NMF factorization).
     pub nonfinite_fixed: usize,
@@ -47,16 +53,40 @@ fn ext_of(path: &Path) -> String {
         .to_lowercase()
 }
 
-/// Load and concatenate every frame contained in `paths`, in sorted order.
+/// Load and concatenate every frame contained in `paths`, in sorted order,
+/// with the detector guessed from the first path (see [`detector_for`]).
 pub fn load_paths(paths: &[PathBuf]) -> Result<ImageStack> {
-    load_paths_with_progress(paths, |_, _| {})
+    load_paths_with_progress(paths, detector_for(paths, None), |_, _| {})
 }
 
-/// Like [`load_paths`], but invokes `on_progress(files_done, files_total)` as
-/// input files finish, so a caller can drive a progress bar. Files are
+/// Detector selection for a set of input files: guessed from the folder
+/// layout of the first path, with `manual` overriding the guess.
+pub fn detector_for(paths: &[PathBuf], manual: Option<Detector>) -> Selection {
+    detect_detector(paths, None, manual)
+}
+
+/// Like [`detector_for`], with the NeXus `BL10:Exp:Det` DASlog value of the
+/// run the files belong to (when located from a run number), which wins
+/// over the folder-layout guess.
+pub fn detect_detector(paths: &[PathBuf], daslog: Option<&str>, manual: Option<Detector>) -> Selection {
+    let mut sel = paths
+        .first()
+        .map(|p| Selection::detect(p, daslog))
+        .unwrap_or_default();
+    sel.manual = manual;
+    sel
+}
+
+/// Like [`load_paths`], but with an explicit detector (deciding how TIFF
+/// pages are oriented) and invoking `on_progress(files_done, files_total)`
+/// as input files finish, so a caller can drive a progress bar. Files are
 /// decoded in parallel (order of the resulting frames still follows the
 /// sorted file order); the callback runs on worker threads.
-pub fn load_paths_with_progress<F>(paths: &[PathBuf], on_progress: F) -> Result<ImageStack>
+pub fn load_paths_with_progress<F>(
+    paths: &[PathBuf],
+    detector: Selection,
+    on_progress: F,
+) -> Result<ImageStack>
 where
     F: Fn(usize, usize) + Sync,
 {
@@ -74,16 +104,17 @@ where
 
     struct FileLoad {
         frames: Vec<Array2<f32>>,
-        transposed: bool,
+        orientation: Orientation,
         nonfinite: usize,
     }
 
+    let tiff_orientation = detector.orientation();
     let per_file: Vec<FileLoad> = sorted
         .par_iter()
         .map(|path| {
-            let (mut frames, transposed) = match ext_of(path).as_str() {
-                "tif" | "tiff" => (load_tiff(path)?, true),
-                "npy" => (load_npy(path)?, false),
+            let (mut frames, orientation) = match ext_of(path).as_str() {
+                "tif" | "tiff" => (load_tiff(path, tiff_orientation)?, tiff_orientation),
+                "npy" => (load_npy(path)?, Orientation::Identity),
                 other => bail!("Unsupported file type '.{other}': {}", path.display()),
             };
             // Sanitize NaN/Inf (dead pixels) to 0 so they cannot poison the
@@ -100,7 +131,7 @@ where
             on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
             Ok(FileLoad {
                 frames,
-                transposed,
+                orientation,
                 nonfinite,
             })
         })
@@ -109,11 +140,15 @@ where
     let mut frames: Vec<Array2<f32>> = Vec::new();
     let mut sources: Vec<PathBuf> = Vec::new();
     let mut dims: Option<(usize, usize)> = None;
-    let mut transposed_on_load = false;
+    // A stack mixing TIFF and .npy files keeps the TIFF orientation (the
+    // .npy frames are assumed to already be in the display orientation).
+    let mut orientation = Orientation::Identity;
     let mut nonfinite_fixed = 0usize;
 
     for (path, loaded) in sorted.iter().zip(per_file) {
-        transposed_on_load |= loaded.transposed;
+        if !loaded.orientation.is_identity() {
+            orientation = loaded.orientation;
+        }
         nonfinite_fixed += loaded.nonfinite;
         for frame in loaded.frames {
             let (h, w) = (frame.shape()[0], frame.shape()[1]);
@@ -142,7 +177,8 @@ where
         width,
         height,
         sources,
-        transposed_on_load,
+        detector,
+        orientation,
         nonfinite_fixed,
     })
 }
@@ -180,8 +216,8 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Read every page of a (possibly multi-page) TIFF file.
-fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
+/// Read every page of a (possibly multi-page) TIFF file, re-oriented.
+fn load_tiff(path: &Path, orientation: Orientation) -> Result<Vec<Array2<f32>>> {
     use tiff::decoder::{Decoder, DecodingResult};
 
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -208,7 +244,7 @@ fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
             DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
         };
 
-        out.push(to_frame(values, w, h)?);
+        out.push(to_frame(values, w, h, orientation)?);
 
         if !decoder.more_images() {
             break;
@@ -276,12 +312,13 @@ fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
 /// Turn a flat, row-major buffer into a frame. If the buffer carries several
 /// samples per pixel (e.g. RGB TIFF) only the first sample is kept.
 ///
-/// TIFF pages are transposed on the way in: the VENUS detectors write them
-/// with rows/columns swapped relative to the sample orientation (same
-/// convention as rust_tiff_viewer and the hype_control COR preview). The
-/// .npy path is NOT transposed — those arrays come from Python callers that
-/// already pass display-ready data.
-fn to_frame(values: Vec<f32>, w: usize, h: usize) -> Result<Array2<f32>> {
+/// TIFF pages are re-oriented on the way in according to the detector: a
+/// Timepix page is transposed (the detector writes rows/columns swapped
+/// relative to the sample orientation, same convention as rust_tiff_viewer),
+/// a CCD page is flipped vertically. The .npy path is NOT re-oriented —
+/// those arrays come from Python callers that already pass display-ready
+/// data.
+fn to_frame(values: Vec<f32>, w: usize, h: usize, orientation: Orientation) -> Result<Array2<f32>> {
     let expected = w * h;
     let frame = if values.len() == expected {
         Array2::from_shape_vec((h, w), values)?
@@ -297,7 +334,7 @@ fn to_frame(values: Vec<f32>, w: usize, h: usize) -> Result<Array2<f32>> {
             h
         )
     };
-    Ok(frame.reversed_axes().as_standard_layout().into_owned())
+    Ok(orientation.apply(frame))
 }
 
 #[cfg(test)]
@@ -322,6 +359,49 @@ mod tests {
         assert_eq!(stack.n_frames(), 1);
         assert_eq!((stack.height, stack.width), (3, 4));
         assert_eq!(stack.frames[0][(2, 3)], 11.0);
+        // .npy is already-processed data: never re-oriented
+        assert_eq!(stack.orientation, Orientation::Identity);
+    }
+
+    fn write_tiff_u16(path: &Path, w: usize, h: usize, values: &[u16]) {
+        use tiff::encoder::{colortype::Gray16, TiffEncoder};
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        enc.write_image::<Gray16>(w as u32, h as u32, values).unwrap();
+    }
+
+    #[test]
+    fn tiff_orientation_follows_detector() {
+        let dir = tmp_dir("tiff_orient");
+        let path = dir.join("img_00000.tif");
+        // 3 wide × 2 tall on disk: [1 2 3; 4 5 6]
+        write_tiff_u16(&path, 3, 2, &[1, 2, 3, 4, 5, 6]);
+        let sel = |d| Selection { manual: Some(d), ..Default::default() };
+
+        let stack = load_paths_with_progress(&[path.clone()], sel(Detector::Timepix), |_, _| {}).unwrap();
+        assert_eq!(stack.orientation, Orientation::Transpose);
+        assert_eq!((stack.width, stack.height), (2, 3));
+        assert_eq!(stack.frames[0][(2, 0)], 3.0);
+
+        let stack = load_paths_with_progress(&[path.clone()], sel(Detector::Ccd), |_, _| {}).unwrap();
+        assert_eq!(stack.orientation, Orientation::FlipVertical);
+        assert_eq!((stack.width, stack.height), (3, 2));
+        assert_eq!(stack.frames[0][(0, 0)], 4.0);
+
+        let stack = load_paths_with_progress(&[path.clone()], sel(Detector::Unknown), |_, _| {}).unwrap();
+        assert_eq!(stack.orientation, Orientation::Identity);
+        assert_eq!(stack.frames[0][(0, 0)], 1.0);
+
+        // no override + no VENUS folder layout: loaded as-is
+        assert_eq!(detector_for(&[path], None).detector(), Detector::Unknown);
+        let sel = detector_for(&[PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")], None);
+        assert_eq!(sel.orientation(), Orientation::Transpose);
+        let sel = detector_for(&[PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")], Some(Detector::Ccd));
+        assert_eq!(sel.orientation(), Orientation::FlipVertical);
+        // the run's DASlog beats the folder name; the manual choice beats both
+        let p = [PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")];
+        assert_eq!(detect_detector(&p, Some("Andor CCD iKon-XL"), None).detector(), Detector::Ccd);
+        assert_eq!(detect_detector(&p, Some("Andor CCD iKon-XL"), Some(Detector::Timepix)).detector(), Detector::Timepix);
     }
 
     #[test]

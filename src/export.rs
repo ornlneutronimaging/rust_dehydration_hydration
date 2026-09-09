@@ -9,6 +9,7 @@
 
 use crate::correction::CorrectionParams;
 use anyhow::{Context, Result};
+use detector_orientation::Orientation;
 use ndarray::Array2;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -42,17 +43,14 @@ pub fn make_export_folder(output_dir: &Path, input_dir_name: &str) -> Result<Pat
     Ok(candidate)
 }
 
-/// Write one frame as a grayscale 32-bit float TIFF. `undo_display_transpose`
-/// restores the on-disk orientation for frames the loader transposed (TIFF
-/// input — same convention as rust_roi_selector).
-pub fn write_f32_tiff(path: &Path, frame: &Array2<f32>, undo_display_transpose: bool) -> Result<()> {
+/// Write one frame as a grayscale 32-bit float TIFF. `orientation` is the
+/// one the loader applied (`ImageStack::orientation`); it is undone here so
+/// the file comes out in the on-disk orientation of the input (same
+/// convention as rust_roi_selector).
+pub fn write_f32_tiff(path: &Path, frame: &Array2<f32>, orientation: Orientation) -> Result<()> {
     use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 
-    let data = if undo_display_transpose {
-        frame.t().as_standard_layout().into_owned()
-    } else {
-        frame.as_standard_layout().into_owned()
-    };
+    let data = orientation.undo_view(frame.view());
     let (h, w) = (data.nrows(), data.ncols());
     let file =
         std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
@@ -80,7 +78,7 @@ pub fn export_corrected(
     input_dir_name: &str,
     frames: &[Array2<f32>],
     sources: &[PathBuf],
-    undo_display_transpose: bool,
+    orientation: Orientation,
     provenance: &Provenance,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<PathBuf> {
@@ -91,7 +89,7 @@ pub fn export_corrected(
             .get(i)
             .map(|p| output_name(p))
             .unwrap_or_else(|| format!("image_{i:05}.tif"));
-        write_f32_tiff(&folder.join(name), frame, undo_display_transpose)?;
+        write_f32_tiff(&folder.join(name), frame, orientation)?;
         progress(i + 1, total);
     }
     let json = provenance_json(provenance);
@@ -231,7 +229,7 @@ pub fn start_export(
     input_dir_name: String,
     frames: std::sync::Arc<Vec<Array2<f32>>>,
     sources: Vec<PathBuf>,
-    undo_display_transpose: bool,
+    orientation: Orientation,
     provenance: Provenance,
     ctx: egui::Context,
 ) -> Receiver<ExportMsg> {
@@ -248,7 +246,7 @@ pub fn start_export(
             &input_dir_name,
             &frames,
             &sources,
-            undo_display_transpose,
+            orientation,
             &provenance,
             &mut progress,
         );
@@ -298,12 +296,23 @@ mod tests {
         let dir = tmp_dir("tiff");
         let path = dir.join("img.tif");
         let frame = Array2::from_shape_fn((3, 5), |(y, x)| (y * 5 + x) as f32 * 0.5);
-        // Written with the transpose undone, the loader (which transposes
-        // TIFFs on read) must round-trip to the in-memory orientation.
-        write_f32_tiff(&path, &frame, true).unwrap();
-        let stack = crate::loader::load_paths(&[path]).unwrap();
-        assert_eq!((stack.height, stack.width), (3, 5));
-        assert_eq!(stack.frames[0], frame);
+        // Written with the orientation undone, the loader (which re-orients
+        // TIFFs on read) must round-trip to the in-memory orientation, for
+        // every detector.
+        use crate::loader::{Detector, Selection};
+        for (d, o) in [
+            (Detector::Timepix, Orientation::Transpose),
+            (Detector::Ccd, Orientation::FlipVertical),
+            (Detector::Unknown, Orientation::Identity),
+        ] {
+            write_f32_tiff(&path, &frame, o).unwrap();
+            let sel = Selection { manual: Some(d), ..Default::default() };
+            let stack =
+                crate::loader::load_paths_with_progress(&[path.clone()], sel, |_, _| {}).unwrap();
+            assert_eq!(stack.orientation, o);
+            assert_eq!((stack.height, stack.width), (3, 5));
+            assert_eq!(stack.frames[0], frame, "{d:?}");
+        }
     }
 
     #[test]
@@ -326,7 +335,7 @@ mod tests {
             "Run_1",
             &frames,
             &sources,
-            true,
+            Orientation::Transpose,
             &provenance(),
             &mut |d, t| ticks.push((d, t)),
         )

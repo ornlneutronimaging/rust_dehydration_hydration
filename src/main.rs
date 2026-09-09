@@ -2,7 +2,9 @@
 //! dehydration_hydration notebook: load a stack of TIFF images, denoise it
 //! with the NMF dehydrate/rehydrate algorithm (mbirjax.hsnt), inspect the
 //! result, and export the corrected stack. `--run` does the same without a
-//! GUI, for scripting and pipelines.
+//! GUI, for scripting and pipelines. The data can be given as files/folders
+//! or located from its run number (`--run-number`, NeXus lookup as in
+//! rust_tiff_viewer).
 
 use dehydration_hydration::app::DehydrationApp;
 use dehydration_hydration::correction::{run_correction, CorrectionParams, MATERIALS_FACTOR};
@@ -10,6 +12,7 @@ use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt::DatasetType;
 use dehydration_hydration::loader;
 use dehydration_hydration::nmf::BetaLoss;
+use dehydration_hydration::run_lookup;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
@@ -22,12 +25,22 @@ USAGE:
 ARGS:
   INPUT   TIFF file(s) or a folder of TIFF images (subfolders are searched
           when the folder itself has none). When omitted, the data can be
-          opened from within the application.
+          opened from within the application (also from a run number, see
+          --run-number).
 
 OPTIONS:
+  -r, --run-number <N>     Locate the data from its run number instead of
+                           INPUT: finds /SNS/VENUS/IPTS-*/nexus/VENUS_<N>.nxs.h5
+                           and reads the detector, the image folder and the
+                           detector offset from it. In the window a Timepix
+                           run asks for raw or autoreduce data (the raw
+                           .fits frames cannot be loaded here, so autoreduce
+                           is the usual choice); headless mode loads the
+                           autoreduce TIFFs of a Timepix run and the raw
+                           image(s) of any other run
   --run                    Headless mode: run the correction and export the
                            corrected stack without opening a window
-                           (requires INPUT and --output)
+                           (requires INPUT or --run-number, and --output)
   -o, --output <DIR>       Folder receiving the corrected subfolder
                            '<input>_dehydration_hydration_corrected'
   --materials <N>          Number of materials (default 2); the correction
@@ -42,6 +55,14 @@ OPTIONS:
   -t, --offset <MICROSEC>  Detector offset: constant added to the TOF values
                            of the spectra file (µs, default 0); shifts the
                            TOF and wavelength axes of the profile plots
+  --detector <NAME>        Force the detector the stack is loaded as, which
+                           decides its orientation: timepix (frames
+                           transposed), ccd (flipped vertically), qhy (as-is,
+                           not decided yet) or as-is. By default it is
+                           recognized from the folder layout (images/tpx1,
+                           images/ikonxl, …); the toolbar has a combobox.
+                           Exported images are always written back in the
+                           on-disk orientation of the input
   -h, --help               Show this help
 
 The correction reproduces the dehydration_hydration notebook:
@@ -56,6 +77,9 @@ struct Cli {
     params: CorrectionParams,
     bin: usize,
     offset_us: f64,
+    detector: Option<loader::Detector>,
+    /// `--run-number`: locate the data from the run's NeXus file.
+    run_number: Option<u32>,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -66,6 +90,8 @@ fn parse_args() -> Result<Cli, String> {
         params: CorrectionParams::default(),
         bin: 1,
         offset_us: 0.0,
+        detector: None,
+        run_number: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -79,6 +105,13 @@ fn parse_args() -> Result<Cli, String> {
                 std::process::exit(0);
             }
             "--run" => cli.run = true,
+            "-r" | "--run-number" | "--run_number" => {
+                let v = value("--run-number")?;
+                cli.run_number = match v.trim().parse::<u32>() {
+                    Ok(n) if n > 0 => Some(n),
+                    _ => return Err(format!("invalid --run-number '{v}': expected a positive integer")),
+                };
+            }
             "-o" | "--output" => cli.output = Some(PathBuf::from(value("--output")?)),
             "--materials" => {
                 cli.params.num_materials = value("--materials")?
@@ -126,6 +159,12 @@ fn parse_args() -> Result<Cli, String> {
                     return Err(format!("--offset must be finite (got {})", cli.offset_us));
                 }
             }
+            "--detector" => {
+                let v = value("--detector")?;
+                cli.detector = Some(loader::Detector::parse(&v).ok_or_else(|| {
+                    format!("invalid --detector '{v}': expected timepix, ccd, qhy or as-is")
+                })?);
+            }
             s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
             _ => cli.inputs.push(PathBuf::from(a)),
         }
@@ -137,8 +176,8 @@ fn parse_args() -> Result<Cli, String> {
         return Err("--safety-factor must be at least 1".to_owned());
     }
     if cli.run {
-        if cli.inputs.is_empty() {
-            return Err("--run requires an INPUT folder or files".to_owned());
+        if cli.inputs.is_empty() && cli.run_number.is_none() {
+            return Err("--run requires an INPUT folder or files, or --run-number".to_owned());
         }
         if cli.output.is_none() {
             return Err("--run requires --output <DIR>".to_owned());
@@ -168,23 +207,48 @@ fn expand_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Headless: load, correct, export, print the export folder on stdout.
-fn run_headless(cli: &Cli, files: Vec<PathBuf>) -> anyhow::Result<()> {
+/// The files come from INPUT, plus those of the run given with
+/// `--run-number` (autoreduce TIFFs of a Timepix run, raw images otherwise).
+fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut daslog: Option<String> = None;
+    if let Some(run) = cli.run_number {
+        eprintln!("Locating run {run}…");
+        let info = run_lookup::resolve(run)?;
+        let (run_files, which) = info.default_files()?;
+        eprintln!(
+            "Run {run}: {}, {} — {which} data, {} file(s) in {}",
+            info.ipts,
+            info.detector_text(),
+            run_files.len(),
+            run_files
+                .first()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        daslog = info.detector.clone();
+        files.extend(run_files);
+    }
 
     eprintln!("Loading {} file(s)…", files.len());
     let last_decile = AtomicUsize::new(0);
-    let stack = loader::load_paths_with_progress(&files, |done, total| {
+    let detector = loader::detect_detector(&files, daslog.as_deref(), cli.detector);
+    let stack = loader::load_paths_with_progress(&files, detector, |done, total| {
         let decile = done * 10 / total.max(1);
         if decile > last_decile.swap(decile, Ordering::Relaxed) {
             eprintln!("  loaded {done}/{total}");
         }
     })?;
     eprintln!(
-        "Loaded {} image(s), {}×{} px ({} NaN/Inf pixel(s) zeroed).",
+        "Loaded {} image(s), {}×{} px ({} NaN/Inf pixel(s) zeroed); detector {}: {}.",
         stack.n_frames(),
         stack.width,
         stack.height,
-        stack.nonfinite_fixed
+        stack.nonfinite_fixed,
+        stack.detector.summary(),
+        stack.orientation
     );
 
     let cancel = AtomicBool::new(false);
@@ -233,7 +297,7 @@ fn run_headless(cli: &Cli, files: Vec<PathBuf>) -> anyhow::Result<()> {
         &input_dir_name,
         &out.frames,
         &stack.sources,
-        stack.transposed_on_load,
+        stack.orientation,
         &provenance,
         &mut |_, _| {},
     )?;
@@ -252,6 +316,8 @@ fn main() -> eframe::Result<()> {
     };
     let files = expand_inputs(&cli.inputs);
     let offset_us = cli.offset_us;
+    let detector = cli.detector;
+    let run_number = cli.run_number;
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
@@ -279,8 +345,12 @@ fn main() -> eframe::Result<()> {
                 .set_zoom_factor(dehydration_hydration::zoom::load());
             let mut app = DehydrationApp::new();
             app.set_detector_offset(offset_us);
+            app.set_detector_override(detector);
             if !files.is_empty() {
                 app.start_load(files, &cc.egui_ctx);
+            }
+            if let Some(run) = run_number {
+                app.set_startup_run(run);
             }
             Ok(Box::new(app))
         }),

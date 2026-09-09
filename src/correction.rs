@@ -230,7 +230,8 @@ mod tests {
             width: w,
             height: h,
             sources,
-            transposed_on_load: true,
+            detector: Default::default(),
+            orientation: crate::loader::Orientation::Transpose,
             nonfinite_fixed: 0,
         }
     }

@@ -8,8 +8,9 @@ use crate::colormap::Colormap;
 use crate::correction::{start_correction, CorrectionMsg, CorrectionParams, MATERIALS_FACTOR};
 use crate::export::{start_export, ExportMsg, Provenance};
 use crate::hsnt::{estimate_num_materials, DatasetType, MBIRJAX_COMMIT, MBIRJAX_VERSION};
-use crate::loader::{self, ImageStack};
+use crate::loader::{self, Detector, ImageStack, Selection};
 use crate::nmf::BetaLoss;
+use crate::run_lookup::{self, RunInfo};
 use crate::spectra;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
@@ -17,7 +18,7 @@ use egui_plot::{Corner, CoordinatesFormatter, Legend, MarkerShape, Plot, PlotPoi
 use ndarray::{s, Array2};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 
 /// Width of the colorbar column: gradient strip + ticks + value labels.
@@ -65,6 +66,48 @@ struct LoadJob {
     rx: Receiver<LoadMsg>,
     done: usize,
     total: usize,
+}
+
+/// The "Run number…" dialog: locate a run's images from its run number
+/// (NeXus lookup, see [`run_lookup`]) — same dialog as rust_tiff_viewer.
+struct RunLookup {
+    open: bool,
+    /// Text typed in the run number field.
+    input: String,
+    /// Focus the field on the next frame (dialog just opened).
+    focus: bool,
+    state: RunState,
+}
+
+impl RunLookup {
+    fn new() -> Self {
+        Self {
+            open: false,
+            input: String::new(),
+            focus: false,
+            state: RunState::Idle,
+        }
+    }
+}
+
+enum RunState {
+    Idle,
+    /// Lookup running on a background thread (IPTS scan + NeXus read over
+    /// the network share).
+    Busy {
+        run: u32,
+        rx: Receiver<anyhow::Result<RunInfo>>,
+    },
+    /// Timepix run located: waiting for the raw / autoreduce choice.
+    Found(RunInfo),
+    Failed { run: u32, error: String },
+}
+
+/// Which data of a located Timepix run to load.
+#[derive(Clone, Copy, PartialEq)]
+enum RunChoice {
+    Raw,
+    Autoreduce,
 }
 
 struct CorrJob {
@@ -212,6 +255,21 @@ pub struct DehydrationApp {
     /// Folder the images came from: names the export folder and seeds the
     /// export dialog location.
     input_dir: Option<PathBuf>,
+    /// Files of the current stack (as given to [`Self::start_load`]), so a
+    /// detector change can reload them.
+    input_files: Vec<PathBuf>,
+    /// `BL10:Exp:Det` value of the run the current stack was located from
+    /// (run number lookup), feeding the automatic detector guess; `None`
+    /// when the files were picked by hand.
+    input_daslog: Option<String>,
+    /// "🔍 Run number…" dialog (see [`run_lookup`]).
+    run_lookup: RunLookup,
+    /// Run number given with `--run-number`, looked up on startup.
+    pending_run: Option<u32>,
+    /// Detector chosen in the toolbar combobox / `--detector`, deciding how
+    /// TIFF frames are oriented on load; `None` = guess from the folder
+    /// layout (`images/tpx1`, `images/ikonxl`, …).
+    detector_override: Option<Detector>,
     /// Recently loaded dataset folders, most recent first (persisted).
     recent: Vec<PathBuf>,
 
@@ -293,6 +351,11 @@ impl DehydrationApp {
             stack: None,
             loading: None,
             input_dir: None,
+            input_files: Vec::new(),
+            input_daslog: None,
+            run_lookup: RunLookup::new(),
+            pending_run: None,
+            detector_override: None,
             recent: crate::recent::load(),
             view: View::Raw,
             frame_idx: 0,
@@ -422,22 +485,107 @@ impl DehydrationApp {
 
     // ----- loading -----------------------------------------------------------
 
+    /// Force the detector (hence the orientation) the stack is loaded with,
+    /// `None` to go back to the automatic guess (`--detector`).
+    pub fn set_detector_override(&mut self, detector: Option<Detector>) {
+        self.detector_override = detector;
+    }
+
+    /// Locate `run` and load its data when the window opens
+    /// (`--run-number`).
+    pub fn set_startup_run(&mut self, run: u32) {
+        self.pending_run = Some(run);
+    }
+
+    /// Detector selection for `paths`: the run's DASlog when the files were
+    /// located from a run number, else the folder-layout guess — both
+    /// overridden by the toolbar choice.
+    fn detector_for(&self, paths: &[PathBuf], daslog: Option<&str>) -> Selection {
+        loader::detect_detector(paths, daslog, self.detector_override)
+    }
+
+    /// Toolbar combobox choosing the detector (hence the orientation on
+    /// load): "auto" follows the folder layout, the other entries force one.
+    /// Changing it reloads the current stack.
+    fn detector_combo(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label("Detector:").on_hover_text(
+            "How the TIFF frames are oriented on load: Timepix → transposed, CCD → flipped \
+             vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector from \
+             the folder layout (images/tpx1, images/ikonxl, …).",
+        );
+        let auto_text = match self.stack.as_ref() {
+            Some(s) if s.detector.is_auto() => format!("auto: {}", s.detector.summary()),
+            _ => "auto".to_owned(),
+        };
+        let current = match self.detector_override {
+            None => auto_text.clone(),
+            Some(d) => d.label().to_owned(),
+        };
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("detector")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.detector_override.is_none(), auto_text)
+                    .on_hover_text("Guess the detector from the folder layout")
+                    .clicked()
+                    && self.detector_override.is_some()
+                {
+                    self.detector_override = None;
+                    changed = true;
+                }
+                for d in Detector::ALL {
+                    if ui
+                        .selectable_label(self.detector_override == Some(d), d.label())
+                        .on_hover_text(d.description())
+                        .clicked()
+                        && self.detector_override != Some(d)
+                    {
+                        self.detector_override = Some(d);
+                        changed = true;
+                    }
+                }
+            });
+        if let Some(s) = self.stack.as_ref() {
+            ui.label(egui::RichText::new(s.orientation.label()).weak())
+                .on_hover_text(s.detector.detector().description());
+        }
+        if changed && !self.input_files.is_empty() && self.loading.is_none() {
+            let files = self.input_files.clone();
+            let daslog = self.input_daslog.clone();
+            self.start_load_from(files, daslog, ctx);
+        }
+    }
+
+    /// Load `paths` (picked by hand: the detector is guessed from the folder
+    /// layout).
     pub fn start_load(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        self.start_load_from(paths, None, ctx);
+    }
+
+    /// Load `paths`, with the `BL10:Exp:Det` DASlog value of their run when
+    /// they were located from a run number.
+    /// Returns whether the load started (`false` while a correction or an
+    /// export is running).
+    fn start_load_from(&mut self, paths: Vec<PathBuf>, daslog: Option<String>, ctx: &egui::Context) -> bool {
         if paths.is_empty() {
-            return;
+            return false;
         }
         if self.corr_job.is_some() || self.export_job.is_some() {
             self.status = "Wait for the running job to finish (or cancel it) first.".to_owned();
-            return;
+            return false;
         }
         let total = paths.len();
+        let detector = self.detector_for(&paths, daslog.as_deref());
+        self.input_files = paths.clone();
+        self.input_daslog = daslog;
         let (tx, rx) = std::sync::mpsc::channel();
         // Loading is parallel, so the progress callback fires from worker
         // threads; the channel sender goes behind a mutex (Sender is !Sync).
         let progress_tx = std::sync::Mutex::new(tx.clone());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = loader::load_paths_with_progress(&paths, |done, total| {
+            let result = loader::load_paths_with_progress(&paths, detector, |done, total| {
                 if let Ok(sender) = progress_tx.lock() {
                     let _ = sender.send(LoadMsg::Progress { done, total });
                 }
@@ -448,6 +596,7 @@ impl DehydrationApp {
         });
         self.loading = Some(LoadJob { rx, done: 0, total });
         self.status = format!("Loading {total} file(s)…");
+        true
     }
 
     fn poll_load(&mut self) {
@@ -519,7 +668,13 @@ impl DehydrationApp {
         } else {
             ""
         };
-        self.status = format!("Loaded {n} image(s), {w}×{h} px.{spectra_note}");
+        let (detector, orientation) = {
+            let s = self.stack.as_ref().expect("stack just set");
+            (s.detector.summary(), s.orientation)
+        };
+        self.status = format!(
+            "Loaded {n} image(s), {w}×{h} px, {detector}: {orientation}.{spectra_note}"
+        );
     }
 
     // ----- material estimation ("Auto") --------------------------------------
@@ -702,7 +857,7 @@ impl DehydrationApp {
             input_dir_name,
             result.frames.clone(),
             stack.sources.clone(),
-            stack.transposed_on_load,
+            stack.orientation,
             provenance,
             ctx.clone(),
         );
@@ -1025,6 +1180,284 @@ impl DehydrationApp {
         }
     }
 
+    // ----- run number lookup ---------------------------------------------------
+
+    fn open_run_dialog(&mut self) {
+        self.run_lookup.open = true;
+        self.run_lookup.focus = true;
+    }
+
+    /// Locate `run` on a background thread; the dialog shows the progress
+    /// and, for a Timepix run, the raw / autoreduce choice.
+    fn start_run_lookup(&mut self, run: u32, ctx: &egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_lookup::resolve(run));
+            ctx.request_repaint();
+        });
+        self.run_lookup.state = RunState::Busy { run, rx };
+        self.run_lookup.input = run.to_string();
+        self.run_lookup.open = true;
+        self.status = format!("Locating run {run}…");
+    }
+
+    /// Collect a finished lookup: a non-Timepix run loads its raw data right
+    /// away, a Timepix run waits in the dialog for the raw / autoreduce
+    /// choice. Then start the `--run-number` lookup once the window is up.
+    fn poll_run_lookup(&mut self, ctx: &egui::Context) {
+        if let RunState::Busy { run, rx } = &self.run_lookup.state {
+            let run = *run;
+            let result = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("the lookup thread stopped unexpectedly")))
+                }
+            };
+            match result {
+                None => {}
+                Some(Ok(info)) if info.is_timepix() => {
+                    self.status = format!(
+                        "Run {run} ({}, {}): Timepix data — pick raw or autoreduce in the dialog.",
+                        info.ipts,
+                        info.detector_text()
+                    );
+                    self.run_lookup.state = RunState::Found(info);
+                    self.run_lookup.open = true;
+                }
+                Some(Ok(info)) => self.load_run_stack(&info, RunChoice::Raw, ctx),
+                Some(Err(e)) => {
+                    let error = format!("{e:#}");
+                    self.status = format!("Run {run}: {error}");
+                    self.run_lookup.state = RunState::Failed { run, error };
+                }
+            }
+        }
+        if matches!(self.run_lookup.state, RunState::Idle)
+            && !self.run_lookup.open
+            && self.loading.is_none()
+            && let Some(run) = self.pending_run.take()
+        {
+            self.start_run_lookup(run, ctx);
+        }
+    }
+
+    /// Load the chosen data of a located run and close the dialog. The
+    /// detector offset recorded with the run replaces the current one, and
+    /// the run's detector (`BL10:Exp:Det`) decides the orientation.
+    fn load_run_stack(&mut self, info: &RunInfo, choice: RunChoice, ctx: &egui::Context) {
+        let run = info.run;
+        let (files, which) = match choice {
+            RunChoice::Raw => (info.raw_files(), "raw"),
+            RunChoice::Autoreduce => (info.autoreduce_files(), "autoreduce"),
+        };
+        let mut head = format!("Run {run} ({}, {})", info.ipts, info.detector_text());
+        if let Some(offset) = info.offset_us {
+            self.offset_us = offset;
+            head.push_str(&format!(", offset {offset:.3} µs"));
+        }
+        let files = match files {
+            Ok(files) if !files.is_empty() => files,
+            Ok(_) => {
+                let looked_in = match choice {
+                    RunChoice::Raw => &info.image_dir,
+                    RunChoice::Autoreduce => &info.autoreduce_dir,
+                };
+                let error = format!(
+                    "no loadable image found for this run (looked in {})",
+                    looked_in.display()
+                );
+                self.status = format!("{head}: {error}");
+                self.run_lookup.state = RunState::Failed { run, error };
+                self.run_lookup.open = true;
+                return;
+            }
+            Err(e) => {
+                let error = format!("{e:#}");
+                self.status = format!("{head}: {error}");
+                self.run_lookup.state = RunState::Failed { run, error };
+                self.run_lookup.open = true;
+                return;
+            }
+        };
+        let n = files.len();
+        if self.start_load_from(files, info.detector.clone(), ctx) {
+            self.status = format!("{head}: loading {which} data ({n} file(s))…");
+        }
+        self.run_lookup.state = RunState::Idle;
+        self.run_lookup.open = false;
+    }
+
+    /// The "Locate a run" window: run number field, lookup progress or
+    /// error, and for a Timepix run the raw / autoreduce buttons.
+    fn run_dialog(&mut self, ctx: &egui::Context) {
+        if !self.run_lookup.open {
+            return;
+        }
+        let mut open = true;
+        let mut lookup: Option<u32> = None;
+        let mut parse_error: Option<String> = None;
+        let mut choice: Option<RunChoice> = None;
+        let busy = matches!(self.run_lookup.state, RunState::Busy { .. });
+        egui::Window::new("Locate a run")
+            .id(egui::Id::new("run_dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.set_min_width(440.0);
+                ui.horizontal(|ui| {
+                    ui.label("Run number:");
+                    let edit = ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.run_lookup.input)
+                            .desired_width(100.0)
+                            .hint_text("e.g. 23640"),
+                    );
+                    if self.run_lookup.focus {
+                        edit.request_focus();
+                        self.run_lookup.focus = false;
+                    }
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let go = ui
+                        .add_enabled(!busy, egui::Button::new("🔍 Locate"))
+                        .on_hover_text("Find the NeXus file of this run and the folder of its images")
+                        .clicked();
+                    if go || enter {
+                        match self.run_lookup.input.trim().parse::<u32>() {
+                            Ok(run) if run > 0 => lookup = Some(run),
+                            _ => {
+                                parse_error = Some(format!(
+                                    "“{}” is not a run number (a positive integer)",
+                                    self.run_lookup.input.trim()
+                                ))
+                            }
+                        }
+                    }
+                });
+                ui.small(format!(
+                    "Looks for {}/IPTS-*/nexus/VENUS_<run>.nxs.h5 and reads the detector, \
+                     the image folder and the detector offset from it.",
+                    run_lookup::VENUS_ROOT
+                ));
+                ui.separator();
+                match &self.run_lookup.state {
+                    RunState::Idle => {
+                        ui.label("Type a run number and press Enter.");
+                    }
+                    RunState::Busy { run, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Locating run {run}…"));
+                        });
+                    }
+                    RunState::Failed { run, error } => {
+                        // `run == 0` marks an unparsable run number field.
+                        let text = if *run == 0 {
+                            error.clone()
+                        } else {
+                            format!("Run {run}: {error}")
+                        };
+                        ui.colored_label(ui.visuals().error_fg_color, text);
+                    }
+                    RunState::Found(info) => {
+                        ui.label(format!(
+                            "Run {}: {} — {}",
+                            info.run,
+                            info.ipts,
+                            info.detector_text()
+                        ));
+                        ui.small(info.nexus.display().to_string());
+                        match info.offset_us {
+                            Some(v) => ui.small(format!(
+                                "Detector offset from the run: {v:.3} µs ({}/average_value)",
+                                run_lookup::OFFSET_LOG
+                            )),
+                            None => ui.small(format!(
+                                "No detector offset in the run ({} log missing): the current \
+                                 offset is kept",
+                                run_lookup::OFFSET_LOG
+                            )),
+                        };
+                        ui.add_space(4.0);
+                        ui.label("Timepix detector — which data do you want to load?");
+                        let raw = info.raw.first();
+                        ui.horizontal(|ui| {
+                            let text = match raw {
+                                Some(s) => format!("Raw ({})", s.size_text()),
+                                None => "Raw".to_owned(),
+                            };
+                            let b = ui.add_enabled(info.raw_loadable(), egui::Button::new(text));
+                            match raw {
+                                Some(s) => {
+                                    if b.on_hover_text(s.path.display().to_string())
+                                        .on_disabled_hover_text(format!(
+                                            "{}\nThe raw Timepix frames are .fits files, which this \
+                                             program cannot load — use the autoreduce TIFFs",
+                                            s.path.display()
+                                        ))
+                                        .clicked()
+                                    {
+                                        choice = Some(RunChoice::Raw);
+                                    }
+                                }
+                                None => {
+                                    ui.small(format!("not found: {}", info.image_dir.display()));
+                                }
+                            }
+                        });
+                        let auto = info.autoreduce.as_ref();
+                        ui.horizontal(|ui| {
+                            let text = match auto {
+                                Some(s) => format!("Autoreduce ({})", s.size_text()),
+                                None => "Autoreduce".to_owned(),
+                            };
+                            let b = ui.add_enabled(info.autoreduce_loadable(), egui::Button::new(text));
+                            match auto {
+                                Some(s) => {
+                                    if b.on_hover_text(s.path.display().to_string())
+                                        .on_disabled_hover_text(format!(
+                                            "{}\nNo TIFF image in the autoreduce folder yet",
+                                            s.path.display()
+                                        ))
+                                        .clicked()
+                                    {
+                                        choice = Some(RunChoice::Autoreduce);
+                                    }
+                                }
+                                None => {
+                                    ui.small(format!("not found: {}", info.autoreduce_dir.display()));
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        if let Some(err) = parse_error {
+            self.run_lookup.state = RunState::Failed { run: 0, error: err };
+        }
+        if let Some(run) = lookup {
+            self.start_run_lookup(run, ctx);
+        }
+        if let Some(choice) = choice
+            && let RunState::Found(info) = &self.run_lookup.state
+        {
+            let info = info.clone();
+            self.load_run_stack(&info, choice, ctx);
+        }
+        if !open {
+            // Closing the window forgets a located run / error, but a lookup
+            // in flight keeps running so the status bar reports its outcome.
+            if !busy {
+                self.run_lookup.state = RunState::Idle;
+            }
+            self.run_lookup.open = false;
+        }
+    }
+
     // ----- config file (HDF5) -------------------------------------------------
 
     /// The current settings as a [`crate::config::AppConfig`] snapshot.
@@ -1149,6 +1582,18 @@ impl DehydrationApp {
                     self.recent_menu(ui, &ctx);
                 });
             });
+            if ui
+                .add_enabled(!busy, egui::Button::new("🔍 Run number…"))
+                .on_hover_text(
+                    "Locate a run's images from its run number: finds its NeXus file, \
+                     then the raw data — and, for a Timepix run, lets you pick the raw \
+                     or the autoreduce version (also sets the detector and its offset)",
+                )
+                .clicked()
+            {
+                self.open_run_dialog();
+            }
+            ui.add_enabled_ui(!busy, |ui| self.detector_combo(ui, &ctx));
             ui.menu_button("⚙ Config", |ui| {
                 if ui
                     .button("💾 Save settings to HDF5…")
@@ -2209,6 +2654,7 @@ impl eframe::App for DehydrationApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_load();
+        self.poll_run_lookup(&ctx);
         self.poll_correction();
         self.poll_export();
         self.poll_estimation();
@@ -2251,6 +2697,7 @@ impl eframe::App for DehydrationApp {
             self.viewer(ui);
         });
 
+        self.run_dialog(&ctx);
         self.about_modal(&ctx);
     }
 }

@@ -15,6 +15,7 @@ pub mod linalg;
 pub mod loader;
 pub mod nmf;
 pub mod recent;
+pub mod run_lookup;
 pub mod spectra;
 pub mod theme;
 pub mod zoom;

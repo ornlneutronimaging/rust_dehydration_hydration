@@ -5,6 +5,8 @@ edition = "2024"
 description = "Dehydration/hydration (NMF subspace) denoising of a TIFF image stack — native port of the dehydration_hydration notebook"
 
 [dependencies]
+# Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
+detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = "0.35"

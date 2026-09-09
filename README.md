@@ -21,6 +21,15 @@ Imaging*, vol. 11, pp. 663–677, 2025.
    Files load in parallel; NaN/Inf pixels are zeroed (and counted in the
    Data set panel). The **🕒 Recent** menu reopens one of the last 5 dataset
    folders (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).
+   **🔍 Run number…** (or `-r/--run-number N` on the command line) locates the
+   data from its run number instead, as in rust_tiff_viewer: it finds
+   `/SNS/VENUS/IPTS-*/nexus/VENUS_N.nxs.h5` and reads the image folder, the
+   detector (`BL10:Exp:Det`, which also sets the load orientation) and the
+   detector offset (`BL10:Det:TH:DSPT1:TIDelay`, applied to the profile
+   plots) from it. A Timepix run asks for **Raw** or **Autoreduce** data —
+   the raw frames are `.fits` files this program cannot load, so the
+   autoreduce TIFFs (`<IPTS>/shared/autoreduce/<image folder>`) are the
+   usual choice; a CCD run loads its own `*_Run_N_*.tiff` image(s) directly.
 2. **Raw data** view — slide through the images next to the integrated (sum)
    image. The **Data set** panel shows the folder, image count/size, and
    memory footprint.
@@ -74,7 +83,9 @@ dehydration_hydration /SNS/VENUS/IPTS-XXXX/.../Run_YYYY \
 
 Runs the same load → correct → export pipeline without a window (progress on
 stderr, the created folder printed on stdout) — for scripting many runs or
-pipeline integration. `--bin N` runs spatially binned.
+pipeline integration. `--bin N` runs spatially binned. `--run-number N` can
+replace the INPUT path: the autoreduce TIFFs of a Timepix run (or the raw
+image(s) of any other run) are located from the run's NeXus file.
 
 The **ℹ mbirjax** button (top-right) shows the algorithm provenance: the
 mbirjax version the implementation is a port of (0.7.2, tracked as a

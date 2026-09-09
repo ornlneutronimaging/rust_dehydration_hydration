@@ -4,6 +4,7 @@
 #
 # Usage: ./launch_dehydration_hydration.sh [dehydration_hydration arguments...]
 #   e.g. ./launch_dehydration_hydration.sh /SNS/VENUS/IPTS-XXXX/.../Run_YYYY
+#        ./launch_dehydration_hydration.sh --run-number 23640
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +21,7 @@ fi
 needs_build=false
 if [[ ! -x "$BINARY" ]]; then
     needs_build=true
-elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
+elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" "$REPO_DIR/../rust_detector_orientation/src" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
     needs_build=true
 fi
 

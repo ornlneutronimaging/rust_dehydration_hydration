@@ -826,6 +826,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "colorgrad",
+ "detector_orientation",
  "eframe",
  "egui",
  "egui_plot",
@@ -847,6 +848,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "detector_orientation"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
 ]
 
 [[package]]
