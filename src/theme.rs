@@ -45,6 +45,24 @@ pub fn save(theme: egui::Theme) {
     );
 }
 
+/// Make every glyph the tools use render (no "missing glyph" squares).
+///
+/// egui's proportional family is Ubuntu-Light + the two emoji fonts, which
+/// have no arrows (→), subscripts (ₙ), or most math symbols; the bundled
+/// Hack monospace font does, so it is appended as the last fallback. Call
+/// once at start-up, before the first frame.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let family = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    if !family.iter().any(|f| f == "Hack") {
+        family.push("Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// A sun / moon button that flips the theme of the whole application and
 /// saves the choice for every VENUS rust tool. Drop it anywhere in a toolbar.
 pub fn toggle_button(ui: &mut egui::Ui) {

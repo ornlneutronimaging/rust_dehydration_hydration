@@ -2195,7 +2195,7 @@ impl DehydrationApp {
                                 .speed(0.01)
                                 .range(0.1..=100.0),
                         )
-                        .on_hover_text("Source–detector distance for λ = h·t/(mₙ·L)");
+                        .on_hover_text("Source–detector distance for λ = h·t/(m_n·L)");
                     }
                     if self.x_axis != XAxis::Index {
                         ui.label("Detector offset:");
