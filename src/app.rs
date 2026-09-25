@@ -510,7 +510,7 @@ impl DehydrationApp {
     fn detector_combo(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("Detector:").on_hover_text(
             "How the TIFF frames are oriented on load: Timepix → transposed, CCD → flipped \
-             vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector from \
+             vertically, QHY → rotated 90° counterclockwise. 'auto' recognizes the detector from \
              the folder layout (images/tpx1, images/ikonxl, …).",
         );
         let auto_text = match self.stack.as_ref() {

@@ -302,7 +302,7 @@ mod tests {
         use crate::loader::{Detector, Selection};
         for (d, o) in [
             (Detector::Timepix, Orientation::Transpose),
-            (Detector::Ccd, Orientation::FlipVertical),
+            (Detector::Ccd, Orientation::Rotate180),
             (Detector::Unknown, Orientation::Identity),
         ] {
             write_f32_tiff(&path, &frame, o).unwrap();

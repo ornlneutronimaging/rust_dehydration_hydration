@@ -57,8 +57,8 @@ OPTIONS:
                            TOF and wavelength axes of the profile plots
   --detector <NAME>        Force the detector the stack is loaded as, which
                            decides its orientation: timepix (frames
-                           transposed), ccd (flipped vertically), qhy (as-is,
-                           not decided yet) or as-is. By default it is
+                           transposed), ccd (flipped vertically and horizontally), qhy (rotated 90°
+                           counterclockwise) or as-is. By default it is
                            recognized from the folder layout (images/tpx1,
                            images/ikonxl, …); the toolbar has a combobox.
                            Exported images are always written back in the

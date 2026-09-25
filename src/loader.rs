@@ -315,7 +315,7 @@ fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
 /// TIFF pages are re-oriented on the way in according to the detector: a
 /// Timepix page is transposed (the detector writes rows/columns swapped
 /// relative to the sample orientation, same convention as rust_tiff_viewer),
-/// a CCD page is flipped vertically. The .npy path is NOT re-oriented —
+/// a CCD page is flipped vertically and horizontally. The .npy path is NOT re-oriented —
 /// those arrays come from Python callers that already pass display-ready
 /// data.
 fn to_frame(values: Vec<f32>, w: usize, h: usize, orientation: Orientation) -> Result<Array2<f32>> {
@@ -384,9 +384,10 @@ mod tests {
         assert_eq!(stack.frames[0][(2, 0)], 3.0);
 
         let stack = load_paths_with_progress(&[path.clone()], sel(Detector::Ccd), |_, _| {}).unwrap();
-        assert_eq!(stack.orientation, Orientation::FlipVertical);
+        assert_eq!(stack.orientation, Orientation::Rotate180);
         assert_eq!((stack.width, stack.height), (3, 2));
-        assert_eq!(stack.frames[0][(0, 0)], 4.0);
+        // rotated 180°: [6 5 4; 3 2 1]
+        assert_eq!(stack.frames[0][(0, 0)], 6.0);
 
         let stack = load_paths_with_progress(&[path.clone()], sel(Detector::Unknown), |_, _| {}).unwrap();
         assert_eq!(stack.orientation, Orientation::Identity);
@@ -397,7 +398,7 @@ mod tests {
         let sel = detector_for(&[PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")], None);
         assert_eq!(sel.orientation(), Orientation::Transpose);
         let sel = detector_for(&[PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")], Some(Detector::Ccd));
-        assert_eq!(sel.orientation(), Orientation::FlipVertical);
+        assert_eq!(sel.orientation(), Orientation::Rotate180);
         // the run's DASlog beats the folder name; the manual choice beats both
         let p = [PathBuf::from("/SNS/VENUS/IPTS-1/images/tpx1/run/a.tif")];
         assert_eq!(detect_detector(&p, Some("Andor CCD iKon-XL"), None).detector(), Detector::Ccd);
