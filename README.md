@@ -32,7 +32,9 @@ Imaging*, vol. 11, pp. 663–677, 2025.
    usual choice; a CCD run loads its own `*_Run_N_*.tiff` image(s) directly.
 2. **Raw data** view — slide through the images next to the integrated (sum)
    image. The **Data set** panel shows the folder, image count/size, and
-   memory footprint.
+   memory footprint. In every image view, **Ctrl + mouse wheel** (⌘ + wheel
+   on macOS, or a trackpad pinch) zooms in/out around the pixel under the
+   cursor; the toolbar **−/+/Fit** buttons do the same from the toolbar.
 3. **Correction parameters** (left panel):
    - **Dataset type** — `attenuation` or `transmission`, where
      attenuation = −log(transmission). Default `attenuation`.

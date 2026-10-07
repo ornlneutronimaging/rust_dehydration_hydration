@@ -333,6 +333,9 @@ pub struct DehydrationApp {
 
     scale: f32,
     fit_requested: bool,
+    /// Scroll offset to apply to the image scroll area on the next frame,
+    /// set by a Ctrl+wheel zoom so the pixel under the cursor stays put.
+    viewer_scroll: Option<egui::Vec2>,
     cursor: Option<(usize, usize, f32)>,
     status: String,
     /// The "ℹ mbirtorch" About dialog (algorithm provenance and versions).
@@ -394,6 +397,7 @@ impl DehydrationApp {
             offset_us: 0.0,
             scale: 1.0,
             fit_requested: false,
+            viewer_scroll: None,
             cursor: None,
             status: "Open a folder of TIFF images to begin.".to_owned(),
             show_about: false,
@@ -2015,6 +2019,31 @@ impl DehydrationApp {
             });
     }
 
+    /// Applies a Ctrl+wheel (or pinch) zoom reported over an image.
+    /// `content` is the point under the cursor in *unscaled* content
+    /// coordinates of the scroll area (image pixels, plus a whole image
+    /// width for the right pane of the dual viewer), `offset` the scroll
+    /// area's current offset. The next frame scrolls so that point stays
+    /// under the cursor.
+    fn apply_wheel_zoom(
+        &mut self,
+        ctx: &egui::Context,
+        content: egui::Vec2,
+        factor: f32,
+        offset: egui::Vec2,
+    ) {
+        let old = self.scale;
+        let new = (old * factor).clamp(0.02, 64.0);
+        if new == old {
+            return;
+        }
+        // The content shifts by its distance to the origin times the scale
+        // change.
+        self.viewer_scroll = Some((offset + content * (new - old)).max(egui::Vec2::ZERO));
+        self.scale = new;
+        ctx.request_repaint();
+    }
+
     /// Two images side by side (raw + integrated, or corrected + raw /
     /// difference) with a shared zoom and the colorbar of the
     /// contrast-controlled left pane.
@@ -2053,40 +2082,54 @@ impl DehydrationApp {
             ];
             ui.allocate_ui(egui::vec2(view_w, view_h), |ui| {
                 ui.set_min_size(egui::vec2(view_w, view_h));
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
-                            let mut cursor = None;
-                            for (tex, img) in &panes {
-                                let Some(tex) = tex else { continue };
-                                let (rect, response) =
-                                    ui.allocate_exact_size(size, Sense::hover());
-                                let full_uv =
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                                ui.painter_at(rect).image(
-                                    tex.id(),
-                                    rect,
-                                    full_uv,
-                                    Color32::WHITE,
-                                );
-                                if let (Some(p), Some(img)) = (response.hover_pos(), img) {
-                                    let ix = ((p.x - rect.left()) / self.scale).floor() as i64;
-                                    let iy = ((p.y - rect.top()) / self.scale).floor() as i64;
-                                    if ix >= 0 && iy >= 0 && (ix as usize) < w && (iy as usize) < h
-                                    {
-                                        cursor = Some((
-                                            ix as usize,
-                                            iy as usize,
-                                            img[(iy as usize, ix as usize)],
-                                        ));
-                                    }
+                let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
+                if let Some(offset) = self.viewer_scroll.take() {
+                    scroll = scroll.scroll_offset(offset);
+                }
+                // A Ctrl+wheel zoom over a pane: (content point under the
+                // cursor, zoom factor). Applied after the scroll area reports
+                // its current offset, so next frame's scale and offset match.
+                let mut wheel_zoom: Option<(egui::Vec2, f32)> = None;
+                let out = scroll.show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
+                        let mut cursor = None;
+                        for (k, (tex, img)) in panes.iter().enumerate() {
+                            let Some(tex) = tex else { continue };
+                            let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+                            let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                            ui.painter_at(rect)
+                                .image(tex.id(), rect, full_uv, Color32::WHITE);
+                            if let (Some(p), Some(img)) = (response.hover_pos(), img) {
+                                let fx = (p.x - rect.left()) / self.scale;
+                                let fy = (p.y - rect.top()) / self.scale;
+                                let ix = fx.floor() as i64;
+                                let iy = fy.floor() as i64;
+                                if ix >= 0 && iy >= 0 && (ix as usize) < w && (iy as usize) < h {
+                                    cursor = Some((
+                                        ix as usize,
+                                        iy as usize,
+                                        img[(iy as usize, ix as usize)],
+                                    ));
+                                }
+                                // egui turns Ctrl (Cmd on macOS) + wheel into a
+                                // zoom factor instead of a scroll; a pinch
+                                // arrives the same way.
+                                let factor = ui.input(|i| i.zoom_delta());
+                                if factor != 1.0 {
+                                    // The right pane sits one image width (plus
+                                    // the gap, which does not scale) further in.
+                                    let content = egui::vec2(fx + k as f32 * w as f32, fy);
+                                    wheel_zoom = Some((content, factor));
                                 }
                             }
-                            self.cursor = cursor;
-                        });
+                        }
+                        self.cursor = cursor;
                     });
+                });
+                if let Some((content, factor)) = wheel_zoom {
+                    self.apply_wheel_zoom(ui.ctx(), content, factor, out.state.offset);
+                }
             });
 
             self.colorbar(ui, view_h);
@@ -2123,13 +2166,20 @@ impl DehydrationApp {
                     self.scale = s.clamp(0.02, 64.0);
                     self.fit_requested = false;
                 }
-                egui::ScrollArea::both()
+                let mut scroll = egui::ScrollArea::both()
                     .id_salt("profile_img")
                     .auto_shrink([false, false])
-                    .max_height((body_h - 40.0).max(120.0))
-                    .show(ui, |ui| {
-                        self.profile_image(ui, w, h);
-                    });
+                    .max_height((body_h - 40.0).max(120.0));
+                if let Some(offset) = self.viewer_scroll.take() {
+                    scroll = scroll.scroll_offset(offset);
+                }
+                let mut wheel_zoom: Option<(egui::Vec2, f32)> = None;
+                let out = scroll.show(ui, |ui| {
+                    wheel_zoom = self.profile_image(ui, w, h);
+                });
+                if let Some((content, factor)) = wheel_zoom {
+                    self.apply_wheel_zoom(ui.ctx(), content, factor, out.state.offset);
+                }
             });
 
             ui.separator();
@@ -2310,10 +2360,15 @@ impl DehydrationApp {
 
     /// The integrated corrected image with the profile region rectangle;
     /// dragging draws a new region.
-    fn profile_image(&mut self, ui: &mut egui::Ui, w: usize, h: usize) {
-        let Some(tex) = self.tex_left.clone() else {
-            return;
-        };
+    /// Returns a pending Ctrl+wheel zoom (image point under the cursor,
+    /// zoom factor) for the caller to apply once the scroll offset is known.
+    fn profile_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: usize,
+        h: usize,
+    ) -> Option<(egui::Vec2, f32)> {
+        let tex = self.tex_left.clone()?;
         let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -2520,6 +2575,17 @@ impl DehydrationApp {
                 painter.line_segment([a, b], Stroke::new(1.5, Color32::YELLOW));
             }
         }
+
+        // egui turns Ctrl (Cmd on macOS) + wheel into a zoom factor instead
+        // of a scroll; a pinch arrives the same way.
+        if let Some(p) = response.hover_pos() {
+            let factor = ui.input(|i| i.zoom_delta());
+            if factor != 1.0 {
+                let (ix, iy) = to_img(p);
+                return Some((egui::vec2(ix, iy), factor));
+            }
+        }
+        None
     }
 
     /// Vertical colorbar for the current contrast range (left pane).
