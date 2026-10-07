@@ -275,6 +275,15 @@ pub struct DehydrationApp {
     detector_override: Option<Detector>,
     /// Recently loaded dataset folders, most recent first (persisted).
     recent: Vec<PathBuf>,
+    /// IPTS chosen in the toolbar (`--ipts`, or the run of a run-number
+    /// lookup): the open dialogs then start in that experiment's `shared`
+    /// folder instead of the VENUS root.
+    selected_ipts: Option<u32>,
+    /// `IPTS-*` folders found under the VENUS root, newest first (`None`
+    /// until the background scan is done).
+    ipts_list: Option<Vec<u32>>,
+    ipts_scan: Option<Receiver<Vec<u32>>>,
+    ipts_filter: String,
 
     view: View,
     frame_idx: usize,
@@ -363,6 +372,10 @@ impl DehydrationApp {
             pending_run: None,
             detector_override: None,
             recent: crate::recent::load(),
+            selected_ipts: None,
+            ipts_list: None,
+            ipts_scan: None,
+            ipts_filter: String::new(),
             view: View::Raw,
             frame_idx: 0,
             colormap: Colormap::Viridis,
@@ -1132,12 +1145,148 @@ impl DehydrationApp {
         self.tex_dirty = false;
     }
 
+    // ----- IPTS / dialog start folder -----------------------------------------
+
+    /// Pre-select an IPTS (`--ipts`): the open dialogs start in its `shared`
+    /// folder.
+    pub fn set_ipts(&mut self, ipts: Option<u32>) {
+        self.selected_ipts = ipts;
+    }
+
+    /// Where the *Open Folder…* / *Open Files…* dialogs start: the selected
+    /// IPTS's `shared` folder (the IPTS root when it has no `shared`), or the
+    /// VENUS root when no IPTS is selected.
+    fn dialog_start_dir(&self) -> PathBuf {
+        let root = PathBuf::from(crate::run_lookup::VENUS_ROOT);
+        let Some(ipts) = self.selected_ipts else {
+            return root;
+        };
+        let ipts_dir = root.join(format!("IPTS-{ipts}"));
+        let shared = ipts_dir.join("shared");
+        if shared.is_dir() {
+            shared
+        } else if ipts_dir.is_dir() {
+            ipts_dir
+        } else {
+            root
+        }
+    }
+
+    /// List the `IPTS-*` folders of the VENUS root on a background thread
+    /// (the root is on a network file system — the toolbar must not wait).
+    fn start_ipts_scan(&mut self, ctx: &egui::Context) {
+        if self.ipts_list.is_some() || self.ipts_scan.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ipts_scan = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut found: Vec<u32> = std::fs::read_dir(crate::run_lookup::VENUS_ROOT)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()?
+                        .strip_prefix("IPTS-")?
+                        .parse::<u32>()
+                        .ok()
+                })
+                .collect();
+            found.sort_unstable_by(|a, b| b.cmp(a));
+            found.dedup();
+            let _ = tx.send(found);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Toolbar "IPTS" drop-down: the experiments found under the VENUS root,
+    /// newest first, with a filter box; "none" goes back to the VENUS root.
+    fn ipts_combo(&mut self, ui: &mut egui::Ui) {
+        self.start_ipts_scan(ui.ctx());
+        if let Some(rx) = &self.ipts_scan
+            && let Ok(list) = rx.try_recv()
+        {
+            self.ipts_list = Some(list);
+            self.ipts_scan = None;
+        }
+        let selected_text = match self.selected_ipts {
+            Some(n) => format!("IPTS-{n}"),
+            None => "IPTS: none".to_owned(),
+        };
+        egui::ComboBox::from_id_salt("ipts_combo")
+            .selected_text(selected_text)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                ui.set_min_width(180.0);
+                match &self.ipts_list {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Scanning {} …", crate::run_lookup::VENUS_ROOT));
+                        });
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    Some(list) => {
+                        let list = list.clone();
+                        ui.horizontal(|ui| {
+                            ui.label("Filter:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ipts_filter)
+                                    .desired_width(80.0),
+                            );
+                        });
+                        let filter = self.ipts_filter.trim().to_owned();
+                        if ui
+                            .selectable_label(self.selected_ipts.is_none(), "none (VENUS root)")
+                            .clicked()
+                        {
+                            self.selected_ipts = None;
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let mut any = false;
+                                for n in list {
+                                    if !filter.is_empty() && !n.to_string().contains(&filter) {
+                                        continue;
+                                    }
+                                    any = true;
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_ipts == Some(n),
+                                            format!("IPTS-{n}"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_ipts = Some(n);
+                                    }
+                                }
+                                if !any {
+                                    ui.label("No IPTS matches the filter.");
+                                }
+                            });
+                    }
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "Experiment the open dialogs start in: {}/IPTS-<n>/shared (none: {})",
+                crate::run_lookup::VENUS_ROOT,
+                crate::run_lookup::VENUS_ROOT
+            ));
+    }
+
     // ----- dialogs -----------------------------------------------------------
 
     fn open_files_dialog(&mut self, ctx: &egui::Context) {
         if let Some(files) = rfd::FileDialog::new()
             .add_filter("Images", loader::SUPPORTED_EXTENSIONS)
             .set_title("Open TIFF image(s)")
+            .set_directory(self.dialog_start_dir())
             .pick_files()
         {
             self.start_load(files, ctx);
@@ -1178,11 +1327,110 @@ impl DehydrationApp {
     fn open_folder_dialog(&mut self, ctx: &egui::Context) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title("Open the folder containing the images to correct")
+            .set_directory(self.dialog_start_dir())
             .pick_folder()
         {
             match loader::list_supported_in_dir(&dir) {
                 Ok(files) => self.start_load(files, ctx),
                 Err(e) => self.status = format!("{e:#}"),
+            }
+        }
+    }
+
+    // ----- drag & drop ---------------------------------------------------------
+
+    /// Files or folders dropped onto the window are loaded exactly as the
+    /// *Open Folder…* / *Open Files…* buttons would: a dropped folder loads
+    /// its images (looking into subfolders when it holds none itself),
+    /// dropped TIFF / `.npy` files load as the stack. Only one folder is
+    /// taken per drop — the stack is one dataset. Ignored while a job runs.
+    /// While something is dragged over the window, a dark overlay says what
+    /// can be dropped.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let rect = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(170));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop a folder of TIFF images, or TIFF / .npy files",
+                egui::FontId::proportional(22.0),
+                Color32::WHITE,
+            );
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if self.loading.is_some() || self.corr_job.is_some() || self.export_job.is_some() {
+            self.status = "Wait for the running job to finish (or cancel it) first.".to_owned();
+            return;
+        }
+        let mut folders: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        for path in dropped {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.is_file() && loader::SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+                files.push(path);
+            } else {
+                rejected.push(
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                );
+            }
+        }
+        let mut notes: Vec<String> = Vec::new();
+        if !rejected.is_empty() {
+            notes.push(format!(
+                "ignored (not a folder, TIFF or .npy): {}",
+                rejected.join(", ")
+            ));
+        }
+        if let Some(dir) = folders.first() {
+            if folders.len() > 1 || !files.is_empty() {
+                notes.push(format!(
+                    "one dataset at a time — loading only {}",
+                    dir.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string())
+                ));
+            }
+            match loader::list_supported_in_dir(dir) {
+                Ok(paths) => {
+                    self.start_load(paths, ctx);
+                }
+                Err(e) => notes.insert(0, format!("{e:#}")),
+            }
+        } else if !files.is_empty() {
+            files.sort();
+            files.dedup();
+            self.start_load(files, ctx);
+        }
+        if !notes.is_empty() {
+            let notes = notes.join("; ");
+            // Keep the "Loading…" message when a load did start.
+            if self.loading.is_some() {
+                self.status = format!("{} ({notes})", self.status);
+            } else {
+                self.status = notes;
             }
         }
     }
@@ -1255,6 +1503,14 @@ impl DehydrationApp {
     /// the run's detector (`BL10:Exp:Det`) decides the orientation.
     fn load_run_stack(&mut self, info: &RunInfo, choice: RunChoice, ctx: &egui::Context) {
         let run = info.run;
+        // The run's experiment becomes the dialogs' starting point.
+        if let Some(n) = info
+            .ipts
+            .strip_prefix("IPTS-")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            self.selected_ipts = Some(n);
+        }
         let (files, which) = match choice {
             RunChoice::Raw => (info.raw_files(), "raw"),
             RunChoice::Autoreduce => (info.autoreduce_files(), "autoreduce"),
@@ -1572,6 +1828,7 @@ impl DehydrationApp {
         ui.horizontal_wrapped(|ui| {
             let busy = self.loading.is_some();
             let ctx = ui.ctx().clone();
+            self.ipts_combo(ui);
             if ui
                 .add_enabled(!busy, egui::Button::new("📁 Open Folder…"))
                 .clicked()
@@ -2736,6 +2993,7 @@ impl eframe::App for DehydrationApp {
         }
         self.recompute_profiles();
         self.ensure_textures(&ctx);
+        self.handle_drops(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(ui);

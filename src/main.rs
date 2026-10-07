@@ -29,6 +29,11 @@ ARGS:
           --run-number).
 
 OPTIONS:
+      --ipts <N>           Pre-select the experiment (N or IPTS-N): the toolbar
+                           IPTS drop-down, which makes the Open Folder / Open
+                           Files dialogs start in /SNS/VENUS/IPTS-N/shared
+                           (without it they start in /SNS/VENUS). A run number
+                           lookup selects the run's IPTS by itself
   -r, --run-number <N>     Locate the data from its run number instead of
                            INPUT: finds /SNS/VENUS/IPTS-*/nexus/VENUS_<N>.nxs.h5
                            and reads the detector, the image folder and the
@@ -80,6 +85,8 @@ struct Cli {
     detector: Option<loader::Detector>,
     /// `--run-number`: locate the data from the run's NeXus file.
     run_number: Option<u32>,
+    /// `--ipts`: pre-select the experiment the open dialogs start in.
+    ipts: Option<u32>,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -92,6 +99,7 @@ fn parse_args() -> Result<Cli, String> {
         offset_us: 0.0,
         detector: None,
         run_number: None,
+        ipts: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -110,6 +118,19 @@ fn parse_args() -> Result<Cli, String> {
                 cli.run_number = match v.trim().parse::<u32>() {
                     Ok(n) if n > 0 => Some(n),
                     _ => return Err(format!("invalid --run-number '{v}': expected a positive integer")),
+                };
+            }
+            "--ipts" => {
+                let v = value("--ipts")?;
+                let digits = v.trim().to_ascii_uppercase();
+                let digits = digits.strip_prefix("IPTS-").unwrap_or(&digits);
+                cli.ipts = match digits.parse::<u32>() {
+                    Ok(n) if n > 0 => Some(n),
+                    _ => {
+                        return Err(format!(
+                            "invalid --ipts '{v}': expected a number or IPTS-<number>"
+                        ));
+                    }
                 };
             }
             "-o" | "--output" => cli.output = Some(PathBuf::from(value("--output")?)),
@@ -307,6 +328,12 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn main() -> eframe::Result<()> {
+    // The classic GTK file chooser (with a typeable path and a starting
+    // folder), never the XDG portal dialog, which ignores set_directory.
+    if std::env::var_os("GTK_USE_PORTAL").is_none() {
+        // SAFETY: called before any other thread exists (start of main).
+        unsafe { std::env::set_var("GTK_USE_PORTAL", "0") };
+    }
     let cli = match parse_args() {
         Ok(cli) => cli,
         Err(e) => {
@@ -318,6 +345,7 @@ fn main() -> eframe::Result<()> {
     let offset_us = cli.offset_us;
     let detector = cli.detector;
     let run_number = cli.run_number;
+    let ipts = cli.ipts;
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
@@ -347,6 +375,7 @@ fn main() -> eframe::Result<()> {
             let mut app = DehydrationApp::new();
             app.set_detector_offset(offset_us);
             app.set_detector_override(detector);
+            app.set_ipts(ipts);
             if !files.is_empty() {
                 app.start_load(files, &cc.egui_ctx);
             }

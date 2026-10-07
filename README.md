@@ -18,6 +18,12 @@ Imaging*, vol. 11, pp. 663–677, 2025.
 
 1. **Open Folder…** — select the folder containing the TIFF images to correct
    (when the folder has none, its subfolders are searched, like the notebook).
+   The classic GTK file chooser (typeable path) opens in `/SNS/VENUS`, or in
+   `/SNS/VENUS/IPTS-N/shared` when an experiment is picked in the toolbar
+   **IPTS** drop-down (`--ipts N` pre-selects it; a run-number lookup selects
+   the run's IPTS).
+   A folder, or TIFF / `.npy` files, can also be **dragged & dropped** onto
+   the window (one dataset per drop).
    Files load in parallel; NaN/Inf pixels are zeroed (and counted in the
    Data set panel). The **🕒 Recent** menu reopens one of the last 5 dataset
    folders (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).

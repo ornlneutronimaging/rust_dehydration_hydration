@@ -36,4 +36,7 @@ if $needs_build; then
     (cd "$REPO_DIR" && "$CARGO" build --release)
 fi
 
+# Classic GTK file chooser (typeable path, honors the starting folder), not
+# the XDG portal dialog.
+export GTK_USE_PORTAL=0
 exec "$BINARY" "$@"
