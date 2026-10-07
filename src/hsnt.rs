@@ -1,4 +1,4 @@
-//! Native port of `mbirjax.hsnt.hyper_denoise` / `dehydrate` / `rehydrate`:
+//! Native port of `mbirtorch.hsnt.hyper_denoise` / `dehydrate` / `rehydrate`:
 //!
 //! M. S. N. Chowdhury et al., "Fast Hyperspectral Neutron Tomography," IEEE
 //! Transactions on Computational Imaging, vol. 11, pp. 663–677, 2025.
@@ -15,8 +15,9 @@
 //! notebook's use):
 //! * `num_materials` is always provided by the GUI, so the automatic
 //!   subspace-dimension estimation is not ported;
-//! * the batch row permutation and the SVD test matrix are seeded, so runs
-//!   are reproducible;
+//! * the batch row permutation and the SVD test matrix are always seeded
+//!   (the Python code only is when `random_state` is given), so runs are
+//!   reproducible;
 //! * the final `W·H` product is computed in f64 and cast to f32 (Python
 //!   casts to f32 first).
 
@@ -26,11 +27,14 @@ use anyhow::Result;
 use ndarray::{s, Array2, ArrayView2, Axis};
 use std::sync::atomic::AtomicBool;
 
-/// Version of the mbirjax library this module is a native port of. Bump
-/// after diffing the denoising functions of `mbirjax/hsnt.py` against the
+/// Version of the mbirtorch library this module is a native port of. Bump
+/// after diffing the denoising functions of `mbirtorch/hsnt.py` against the
 /// newer release (the HDF5 utilities in that file are not part of the port).
-pub const MBIRJAX_VERSION: &str = "0.7.2";
-pub const MBIRJAX_COMMIT: &str = "7bb2009, 2026-07-24";
+/// History: the port was written against mbirjax 0.7.2 (commit 7bb2009),
+/// whose `hsnt.py` the mbirtorch module took over unchanged except for the
+/// `random_state` argument; MBIRTorch succeeded mbirjax in 2026.
+pub const MBIRTORCH_VERSION: &str = "0.1.1";
+pub const MBIRTORCH_COMMIT: &str = "d75f13e, 2026-09-20";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DatasetType {

@@ -1,5 +1,5 @@
 //! Non-negative matrix factorization, equivalent to scikit-learn's
-//! `non_negative_factorization` as used by `mbirjax.hsnt`:
+//! `non_negative_factorization` as used by `mbirtorch.hsnt`:
 //!
 //! * initialization: NNDSVD (Boutsidis & Gallopoulos) from a randomized SVD,
 //! * `beta_loss='frobenius'` → coordinate-descent / HALS updates (sklearn's

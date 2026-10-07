@@ -7,7 +7,7 @@
 use crate::colormap::Colormap;
 use crate::correction::{start_correction, CorrectionMsg, CorrectionParams, MATERIALS_FACTOR};
 use crate::export::{start_export, ExportMsg, Provenance};
-use crate::hsnt::{estimate_num_materials, DatasetType, MBIRJAX_COMMIT, MBIRJAX_VERSION};
+use crate::hsnt::{estimate_num_materials, DatasetType, MBIRTORCH_COMMIT, MBIRTORCH_VERSION};
 use crate::loader::{self, Detector, ImageStack, Selection};
 use crate::nmf::BetaLoss;
 use crate::run_lookup::{self, RunInfo};
@@ -31,13 +31,16 @@ const PREVIEW_BIN: usize = 2;
 const ESTIMATE_SAMPLE: usize = 384;
 
 /// ORNL Neutron Imaging team logo (same asset as the other rust
-/// applications) and the MBIRJAX logo (the Purdue library the correction is
+/// applications) and the MBIRTorch logo (the Purdue library the correction is
 /// a port of), embedded in the binary and shown at the bottom-left of the
-/// window. The MBIRJAX logo has a light- and a dark-background variant;
-/// the one matching the active theme is displayed.
+/// window. The MBIRTorch logo has a light- and a dark-background variant;
+/// the one matching the active theme is displayed. The light one is the
+/// official `docs/source/_static/logo.png` of the mbirtorch repository; the
+/// dark one is derived from it by inverting its achromatic (black "MBIR")
+/// pixels to white, the red "Torch" being kept.
 const IMAGING_LOGO_BYTES: &[u8] = include_bytes!("../logos/ImagingLogo.png");
-const MBIRJAX_LOGO_LIGHT_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo.png");
-const MBIRJAX_LOGO_DARK_BYTES: &[u8] = include_bytes!("../logos/mbirjax_logo_dark_background.png");
+const MBIRTORCH_LOGO_LIGHT_BYTES: &[u8] = include_bytes!("../logos/mbirtorch_logo.png");
+const MBIRTORCH_LOGO_DARK_BYTES: &[u8] = include_bytes!("../logos/mbirtorch_logo_dark_background.png");
 const LOGO_HEIGHT: f32 = 44.0;
 
 fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
@@ -332,9 +335,9 @@ pub struct DehydrationApp {
     fit_requested: bool,
     cursor: Option<(usize, usize, f32)>,
     status: String,
-    /// The "ℹ mbirjax" About dialog (algorithm provenance and versions).
+    /// The "ℹ mbirtorch" About dialog (algorithm provenance and versions).
     show_about: bool,
-    /// (imaging, mbirjax-light-bg, mbirjax-dark-bg) logo textures, loaded on
+    /// (imaging, mbirtorch-light-bg, mbirtorch-dark-bg) logo textures, loaded on
     /// the first frame.
     logo_tex: Option<[Option<TextureHandle>; 3]>,
 }
@@ -404,37 +407,37 @@ impl DehydrationApp {
         self.offset_us = offset_us;
     }
 
-    /// The two logos, side by side. The MBIRJAX variant matching the active
+    /// The two logos, side by side. The MBIRTORCH variant matching the active
     /// theme is shown: the official transparent PNG (dark text) on light,
     /// the white-on-black variant on dark.
     fn logos_row(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let [imaging, mbirjax_light, mbirjax_dark] = self.logo_tex.get_or_insert_with(|| {
+        let [imaging, mbirtorch_light, mbirtorch_dark] = self.logo_tex.get_or_insert_with(|| {
             [
                 load_logo(&ctx, "imaging_logo", IMAGING_LOGO_BYTES),
-                load_logo(&ctx, "mbirjax_logo_light", MBIRJAX_LOGO_LIGHT_BYTES),
-                load_logo(&ctx, "mbirjax_logo_dark", MBIRJAX_LOGO_DARK_BYTES),
+                load_logo(&ctx, "mbirtorch_logo_light", MBIRTORCH_LOGO_LIGHT_BYTES),
+                load_logo(&ctx, "mbirtorch_logo_dark", MBIRTORCH_LOGO_DARK_BYTES),
             ]
         });
-        let mbirjax = match ctx.theme() {
-            egui::Theme::Dark => mbirjax_dark,
-            egui::Theme::Light => mbirjax_light,
+        let mbirtorch = match ctx.theme() {
+            egui::Theme::Dark => mbirtorch_dark,
+            egui::Theme::Light => mbirtorch_light,
         };
         ui.horizontal(|ui| {
             if let Some(tex) = imaging {
                 ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
                     .on_hover_text("Neutron Imaging — Oak Ridge National Laboratory");
             }
-            if let Some(tex) = mbirjax {
+            if let Some(tex) = mbirtorch {
                 ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
-                    .on_hover_text(format!("MBIRJAX {MBIRJAX_VERSION} — Purdue University"));
+                    .on_hover_text(format!("MBIRTorch {MBIRTORCH_VERSION} — Purdue University"));
             }
         });
     }
 
     // ----- about dialog ------------------------------------------------------
 
-    /// Modal showing what algorithm this tool runs and which mbirjax version
+    /// Modal showing what algorithm this tool runs and which mbirtorch version
     /// the implementation is a port of.
     fn about_modal(&mut self, ctx: &egui::Context) {
         if !self.show_about {
@@ -447,12 +450,12 @@ impl DehydrationApp {
             ui.separator();
             ui.add_space(4.0);
             ui.label("The correction is a native Rust port of the dehydrate/rehydrate \
-                      denoising of the mbirjax library (module mbirjax.hsnt, function \
+                      denoising of the mbirtorch library (module mbirtorch.hsnt, function \
                       hyper_denoise).");
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "mbirjax version: {MBIRJAX_VERSION}  (commit {MBIRJAX_COMMIT})"
+                    "mbirtorch version: {MBIRTORCH_VERSION}  (commit {MBIRTORCH_COMMIT})"
                 ))
                 .strong(),
             );
@@ -468,8 +471,8 @@ impl DehydrationApp {
                 .small(),
             );
             ui.hyperlink_to(
-                "mbirjax hsnt documentation",
-                "https://mbirjax.readthedocs.io/en/latest/usr_hsnt.html",
+                "mbirtorch hsnt documentation",
+                "https://mbirtorch.readthedocs.io/en/latest/usr_hsnt.html",
             );
             ui.add_space(10.0);
             ui.vertical_centered(|ui| {
@@ -1539,13 +1542,13 @@ impl DehydrationApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Far right: the mbirjax/About button; everything else flows in
+            // Far right: the mbirtorch/About button; everything else flows in
             // from the left inside the nested layout.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button("ℹ mbirjax")
+                    .button("ℹ mbirtorch")
                     .on_hover_text(format!(
-                        "Algorithm provenance — native port of mbirjax {MBIRJAX_VERSION}"
+                        "Algorithm provenance — native port of mbirtorch {MBIRTORCH_VERSION}"
                     ))
                     .clicked()
                 {
@@ -1560,7 +1563,7 @@ impl DehydrationApp {
     }
 
     /// The left-flowing part of the toolbar (everything except the
-    /// right-aligned mbirjax button).
+    /// right-aligned mbirtorch button).
     fn toolbar_left(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let busy = self.loading.is_some();

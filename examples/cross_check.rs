@@ -1,6 +1,6 @@
 //! Cross-validation helper: run the Rust hyper_denoise on a (points × bands)
 //! .npy matrix and write the result, for comparison against the Python
-//! `mbirjax.hsnt.hyper_denoise` output.
+//! `mbirtorch.hsnt.hyper_denoise` output.
 //!
 //! Usage: cross_check <input.npy> <output.npy> [frobenius|kullback-leibler] [attenuation|transmission]
 

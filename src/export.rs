@@ -105,8 +105,8 @@ pub fn provenance_json(p: &Provenance) -> String {
         r#"{{
   "tool": "rust_dehydration_hydration",
   "tool_version": "{version}",
-  "algorithm": "mbirjax.hsnt.hyper_denoise (native port)",
-  "mbirjax_reference_version": "{mbirjax}",
+  "algorithm": "mbirtorch.hsnt.hyper_denoise (native port)",
+  "mbirtorch_reference_version": "{mbirtorch}",
   "created_utc": "{time}",
   "input_folder": "{input}",
   "num_images": {n},
@@ -127,7 +127,7 @@ pub fn provenance_json(p: &Provenance) -> String {
 }}
 "#,
         version = env!("CARGO_PKG_VERSION"),
-        mbirjax = crate::hsnt::MBIRJAX_VERSION,
+        mbirtorch = crate::hsnt::MBIRTORCH_VERSION,
         time = iso8601_utc_now(),
         input = json_escape(&p.input_folder.display().to_string()),
         n = p.num_images,
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(ticks, vec![(1, 2), (2, 2)]);
         let json = std::fs::read_to_string(folder.join("correction_config.json")).unwrap();
         assert!(json.contains("\"num_materials\": 2"));
-        assert!(json.contains("\"mbirjax_reference_version\": \"0.7.2\""));
+        assert!(json.contains("\"mbirtorch_reference_version\": \"0.1.1\""));
         assert!(json.contains("/data/Run_1"));
     }
 

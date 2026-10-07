@@ -1,5 +1,5 @@
 //! Dehydration/Hydration correction library: stack loading, the NMF-based
-//! hyperspectral denoising algorithm (a native port of `mbirjax.hsnt`), and
+//! hyperspectral denoising algorithm (a native port of `mbirtorch.hsnt`), and
 //! TIFF export.
 //!
 //! The GUI binary (`main.rs`) is a thin shell around these modules; they are

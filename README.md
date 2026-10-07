@@ -4,7 +4,7 @@ Native GUI (Rust, [egui](https://github.com/emilk/egui)) that reproduces the
 VENUS **dehydration_hydration** notebook
 (`python_notebooks/notebooks/dehydration_hydration.ipynb`): denoise a stack of
 neutron images with the NMF **dehydrate / rehydrate** algorithm of
-`mbirjax.hsnt.hyper_denoise`, compare the corrected and raw data, and export
+`mbirtorch.hsnt.hyper_denoise`, compare the corrected and raw data, and export
 the corrected stack as 32-bit float TIFFs.
 
 Algorithm reference: M. S. N. Chowdhury, D. Yang, S. Tang,
@@ -12,7 +12,7 @@ S. V. Venkatakrishnan, H. Z. Bilheux, G. T. Buzzard, and C. A. Bouman,
 "Fast Hyperspectral Neutron Tomography," *IEEE Transactions on Computational
 Imaging*, vol. 11, pp. 663–677, 2025.
 [doi:10.1109/TCI.2025.3567854](https://doi.org/10.1109/TCI.2025.3567854) —
-[mbirjax documentation](https://mbirjax.readthedocs.io/en/latest/usr_hsnt.html).
+[mbirtorch documentation](https://mbirtorch.readthedocs.io/en/latest/usr_hsnt.html).
 
 ## Workflow (same as the notebook)
 
@@ -40,7 +40,7 @@ Imaging*, vol. 11, pp. 663–677, 2025.
      contains (1–10, default 2). The NMF subspace dimension is
      2 × this number (safety factor 2). **Auto** estimates it from the data
      (log-linear noise fit to the singular values of sampled pixel spectra —
-     the `_estimate_subspace_dimension` algorithm of mbirjax).
+     the `_estimate_subspace_dimension` algorithm of mbirtorch).
    - **Beta loss** — `frobenius` (coordinate-descent solver) or
      `kullback-leibler` (multiplicative-update solver). Default `frobenius`.
    - **Max iterations** — NMF solver cap (50–1000, default 300).
@@ -87,10 +87,13 @@ pipeline integration. `--bin N` runs spatially binned. `--run-number N` can
 replace the INPUT path: the autoreduce TIFFs of a Timepix run (or the raw
 image(s) of any other run) are located from the run's NeXus file.
 
-The **ℹ mbirjax** button (top-right) shows the algorithm provenance: the
-mbirjax version the implementation is a port of (0.7.2, tracked as a
+The **ℹ mbirtorch** button (top-right) shows the algorithm provenance: the
+mbirtorch version the implementation is a port of (0.1.1, tracked as a
 constant in `src/app.rs` — bump it after diffing the denoising functions of
-`mbirjax/hsnt.py` against the newer release) and the paper reference.
+`mbirtorch/hsnt.py` against the newer release) and the paper reference.
+The port was originally written against mbirjax 0.7.2; the `hsnt` module of
+MBIRTorch (mbirjax's successor) carries the same denoising code, only with an
+added `random_state` argument, so the earlier cross-validation still holds.
 
 ## Build & run
 
@@ -111,7 +114,7 @@ cargo test    # algorithm + IO unit tests, no display needed
 - The NMF (NNDSVD initialization, coordinate-descent solver for the
   Frobenius loss, multiplicative updates for Kullback-Leibler) is a native
   Rust port of the scikit-learn `non_negative_factorization` path used by
-  `mbirjax.hsnt`, parallelized with rayon — no Python, BLAS, or CUDA
+  `mbirtorch.hsnt`, parallelized with rayon — no Python, BLAS, or CUDA
   dependency.
 - Large stacks are processed in batches of 2²⁷ elements exactly like the
   Python code (per-batch basis estimation, basis merging, then a fixed-basis

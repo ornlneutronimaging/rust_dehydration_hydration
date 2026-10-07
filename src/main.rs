@@ -1,6 +1,6 @@
 //! Dehydration/Hydration Correction — native port of the VENUS
 //! dehydration_hydration notebook: load a stack of TIFF images, denoise it
-//! with the NMF dehydrate/rehydrate algorithm (mbirjax.hsnt), inspect the
+//! with the NMF dehydrate/rehydrate algorithm (mbirtorch.hsnt), inspect the
 //! result, and export the corrected stack. `--run` does the same without a
 //! GUI, for scripting and pipelines. The data can be given as files/folders
 //! or located from its run number (`--run-number`, NeXus lookup as in
@@ -66,7 +66,7 @@ OPTIONS:
   -h, --help               Show this help
 
 The correction reproduces the dehydration_hydration notebook:
-mbirjax.hsnt.hyper_denoise — M. S. N. Chowdhury et al., \"Fast Hyperspectral
+mbirtorch.hsnt.hyper_denoise — M. S. N. Chowdhury et al., \"Fast Hyperspectral
 Neutron Tomography\", IEEE Trans. Comput. Imaging 11, 663-677 (2025).
 ";
 
