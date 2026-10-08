@@ -27,6 +27,14 @@ const COLORBAR_WIDTH: f32 = 78.0;
 /// Spatial binning factor of the fast preview run.
 const PREVIEW_BIN: usize = 2;
 
+/// Colors of the profile plot series (fixed, so the legend — sorted by name
+/// — always matches the markers): uncorrected data in orange, corrected in
+/// blue; the single-pixel spectra in lighter tints of the same two.
+const UNCORRECTED_COLOR: Color32 = Color32::from_rgb(255, 140, 0);
+const CORRECTED_COLOR: Color32 = Color32::from_rgb(60, 140, 255);
+const PIXEL_UNCORRECTED_COLOR: Color32 = Color32::from_rgb(255, 200, 120);
+const PIXEL_CORRECTED_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+
 /// Number of randomly sampled pixel spectra used by the material estimation.
 const ESTIMATE_SAMPLE: usize = 384;
 
@@ -2586,26 +2594,34 @@ impl DehydrationApp {
                         plot = plot
                             .y_axis_formatter(|mark, _| fmt_axis(10f64.powf(mark.value)));
                     }
+                    // Explicit colors (never egui_plot's automatic ones, which
+                    // are handed out in insertion order while the legend is
+                    // sorted by name) and the marker glyph in each legend
+                    // entry, so the legend cannot be read the wrong way round.
                     plot.show(ui, |plot_ui| {
                         plot_ui.points(
-                            Points::new("Uncorrected profile", uncorr)
+                            Points::new("Uncorrected profile  ✕", uncorr)
                                 .shape(MarkerShape::Cross)
+                                .color(UNCORRECTED_COLOR)
                                 .radius(3.0),
                         );
                         plot_ui.points(
-                            Points::new("Corrected profile", corr)
+                            Points::new("Corrected profile  ●", corr)
                                 .shape(MarkerShape::Circle)
+                                .color(CORRECTED_COLOR)
                                 .radius(2.5),
                         );
                         if let Some((pu, pc)) = pixel_series {
                             plot_ui.points(
-                                Points::new("Pixel uncorrected", pu)
+                                Points::new("Pixel uncorrected  ✱", pu)
                                     .shape(MarkerShape::Asterisk)
+                                    .color(PIXEL_UNCORRECTED_COLOR)
                                     .radius(2.0),
                             );
                             plot_ui.points(
-                                Points::new("Pixel corrected", pc)
+                                Points::new("Pixel corrected  ◆", pc)
                                     .shape(MarkerShape::Diamond)
+                                    .color(PIXEL_CORRECTED_COLOR)
                                     .radius(2.0),
                             );
                         }
