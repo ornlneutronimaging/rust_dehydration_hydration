@@ -8,16 +8,32 @@
 //! ```text
 //! /                    @tool, @tool_version, @format_version (u32),
 //!                      @created_utc, @input_folder (informational, optional)
-//! /correction          @dataset_type ("attenuation"|"transmission"),
-//!                      @num_materials (u64), @safety_factor (f64),
-//!                      @beta_loss ("frobenius"|"kullback-leibler"),
-//!                      @max_iter (u64)
+//! /correction          @engine ("mbirtorch.hsnt"),
+//!                      @input_type ("auto"|"transmission"|"attenuation"),
+//!                      @rank ("auto" or a number), @max_rank (u64),
+//!                      @spectra ("mle"|"unconstrained"|"support"),
+//!                      @dose (f64, -1 = unknown), @device (string),
+//!                      @mode ("auto"|"full"|"stream"), @max_steps (u64),
+//!                      @rel_tol (f64), @max_passes (u64),
+//!                      @compile ("auto"|"on"|"off")
 //! /physical_axis       @distance_m (f64), @detector_offset_us (f64)
 //! /display             @colormap, @log_y (u8), @contrast_auto (u8),
 //!                      @vmin (f64), @vmax (f64)
 //! /region              @left, @right, @top, @bottom (u64, half-open px
 //!                      bounds) — present only when a region is set
+//! /mask                present only when a mask is defined:
+//!                      @range_lo, @range_hi (f64) when the integrated-value
+//!                      range is set; @file (path of a mask image) when one
+//!                      was loaded (re-read on load, when it still exists);
+//!                      dataset rects (n × 5 u64: left, right, top, bottom,
+//!                      mode 0 = include / 1 = exclude)
 //! ```
+//!
+//! Format version 2 (this beta). A version-1 file of the production tool
+//! (NMF parameters `dataset_type`, `num_materials`, `safety_factor`,
+//! `beta_loss`, `max_iter`) still loads: its dataset type becomes the input
+//! type and its number of materials the rank; the NMF-only values are
+//! ignored.
 //!
 //! Loading is tolerant of missing groups/attributes (defaults fill in) but
 //! rejects files without a `format_version` root attribute and unknown enum
@@ -25,15 +41,15 @@
 
 use crate::colormap::Colormap;
 use crate::correction::CorrectionParams;
-use crate::hsnt::DatasetType;
-use crate::nmf::BetaLoss;
+use crate::hsnt_cli::{Compile, Device, InputType, Rank, SolveMode, Spectra};
+use crate::mask::{MaskRect, RectMode};
 use crate::spectra;
 use anyhow::{bail, Context, Result};
 use hdf5::types::VarLenUnicode;
 use std::path::{Path, PathBuf};
 
 /// Bump when the file layout changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The settings captured by (and restored from) a config file.
 #[derive(Clone, PartialEq, Debug)]
@@ -53,6 +69,10 @@ pub struct AppConfig {
     /// Folder the settings were tuned on — recorded for reference, not
     /// applied on load.
     pub input_folder: Option<PathBuf>,
+    /// The mask definition: rectangles, integrated-value range, mask file.
+    pub mask_rects: Vec<MaskRect>,
+    pub mask_range: Option<(f32, f32)>,
+    pub mask_file: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -68,6 +88,9 @@ impl Default for AppConfig {
             vmax: 1.0,
             region: None,
             input_folder: None,
+            mask_rects: Vec::new(),
+            mask_range: None,
+            mask_file: None,
         }
     }
 }
@@ -84,12 +107,20 @@ pub fn save(path: &Path, cfg: &AppConfig) -> Result<()> {
         write_str(&file, "input_folder", &dir.display().to_string())?;
     }
 
+    let p = &cfg.params;
     let g = file.create_group("correction")?;
-    write_str(&g, "dataset_type", cfg.params.dataset_type.label())?;
-    write_u64(&g, "num_materials", cfg.params.num_materials as u64)?;
-    write_f64(&g, "safety_factor", cfg.params.safety_factor)?;
-    write_str(&g, "beta_loss", cfg.params.beta_loss.label())?;
-    write_u64(&g, "max_iter", cfg.params.max_iter as u64)?;
+    write_str(&g, "engine", "mbirtorch.hsnt")?;
+    write_str(&g, "input_type", p.input_type.label())?;
+    write_str(&g, "rank", &p.rank.label())?;
+    write_u64(&g, "max_rank", p.max_rank as u64)?;
+    write_str(&g, "spectra", p.spectra.label())?;
+    write_f64(&g, "dose", p.dose.unwrap_or(-1.0))?;
+    write_str(&g, "device", &p.device.label())?;
+    write_str(&g, "mode", p.mode.label())?;
+    write_u64(&g, "max_steps", p.max_steps as u64)?;
+    write_f64(&g, "rel_tol", p.rel_tol)?;
+    write_u64(&g, "max_passes", p.max_passes as u64)?;
+    write_str(&g, "compile", p.compile.label())?;
 
     let g = file.create_group("physical_axis")?;
     write_f64(&g, "distance_m", cfg.distance_m)?;
@@ -109,6 +140,28 @@ pub fn save(path: &Path, cfg: &AppConfig) -> Result<()> {
         write_u64(&g, "top", top as u64)?;
         write_u64(&g, "bottom", bottom as u64)?;
     }
+
+    if !cfg.mask_rects.is_empty() || cfg.mask_range.is_some() || cfg.mask_file.is_some() {
+        let g = file.create_group("mask")?;
+        if let Some((lo, hi)) = cfg.mask_range {
+            write_f64(&g, "range_lo", lo as f64)?;
+            write_f64(&g, "range_hi", hi as f64)?;
+        }
+        if let Some(path) = &cfg.mask_file {
+            write_str(&g, "file", &path.display().to_string())?;
+        }
+        if !cfg.mask_rects.is_empty() {
+            let mut rects = ndarray::Array2::<u64>::zeros((cfg.mask_rects.len(), 5));
+            for (i, r) in cfg.mask_rects.iter().enumerate() {
+                rects[(i, 0)] = r.left as u64;
+                rects[(i, 1)] = r.right as u64;
+                rects[(i, 2)] = r.top as u64;
+                rects[(i, 3)] = r.bottom as u64;
+                rects[(i, 4)] = (r.mode == RectMode::Exclude) as u64;
+            }
+            g.new_dataset_builder().with_data(&rects).create("rects")?;
+        }
+    }
     Ok(())
 }
 
@@ -127,20 +180,47 @@ pub fn load(path: &Path) -> Result<AppConfig> {
     cfg.input_folder = read_str(&file, "input_folder").map(PathBuf::from);
 
     if let Ok(g) = file.group("correction") {
+        let p = &mut cfg.params;
+        // Version-1 (production NMF) names, mapped onto the new parameters.
         if let Some(s) = read_str(&g, "dataset_type") {
-            cfg.params.dataset_type = dataset_type_from(&s)?;
+            p.input_type = token(&s, "dataset_type", InputType::parse)?;
         }
         if let Some(v) = read_u64(&g, "num_materials") {
-            cfg.params.num_materials = (v as usize).max(1);
+            p.rank = Rank::Fixed((v as usize).max(1));
         }
-        if let Some(v) = read_f64(&g, "safety_factor").filter(|v| v.is_finite() && *v >= 1.0) {
-            cfg.params.safety_factor = v;
+        // Version-2 names.
+        if let Some(s) = read_str(&g, "input_type") {
+            p.input_type = token(&s, "input_type", InputType::parse)?;
         }
-        if let Some(s) = read_str(&g, "beta_loss") {
-            cfg.params.beta_loss = beta_loss_from(&s)?;
+        if let Some(s) = read_str(&g, "rank") {
+            p.rank = token(&s, "rank", Rank::parse)?;
         }
-        if let Some(v) = read_u64(&g, "max_iter") {
-            cfg.params.max_iter = (v as usize).max(1);
+        if let Some(v) = read_u64(&g, "max_rank") {
+            p.max_rank = (v as usize).max(1);
+        }
+        if let Some(s) = read_str(&g, "spectra") {
+            p.spectra = token(&s, "spectra", Spectra::parse)?;
+        }
+        if let Some(v) = read_f64(&g, "dose") {
+            p.dose = (v.is_finite() && v > 0.0).then_some(v);
+        }
+        if let Some(s) = read_str(&g, "device") {
+            p.device = token(&s, "device", Device::parse)?;
+        }
+        if let Some(s) = read_str(&g, "mode") {
+            p.mode = token(&s, "mode", SolveMode::parse)?;
+        }
+        if let Some(v) = read_u64(&g, "max_steps") {
+            p.max_steps = (v as usize).max(1);
+        }
+        if let Some(v) = read_f64(&g, "rel_tol").filter(|v| v.is_finite() && *v >= 0.0) {
+            p.rel_tol = v;
+        }
+        if let Some(v) = read_u64(&g, "max_passes") {
+            p.max_passes = v as usize;
+        }
+        if let Some(s) = read_str(&g, "compile") {
+            p.compile = token(&s, "compile", Compile::parse)?;
         }
     }
 
@@ -183,25 +263,42 @@ pub fn load(path: &Path) -> Result<AppConfig> {
             }
         }
     }
+
+    if let Ok(g) = file.group("mask") {
+        if let (Some(lo), Some(hi)) = (read_f64(&g, "range_lo"), read_f64(&g, "range_hi"))
+            && lo.is_finite()
+            && hi.is_finite()
+            && lo <= hi
+        {
+            cfg.mask_range = Some((lo as f32, hi as f32));
+        }
+        cfg.mask_file = read_str(&g, "file").map(PathBuf::from);
+        if let Ok(ds) = g.dataset("rects") {
+            let rects = ds.read_2d::<u64>().context("read the mask rectangles")?;
+            if rects.ncols() != 5 {
+                bail!("mask rectangles have {} columns, expected 5", rects.ncols());
+            }
+            for row in rects.rows() {
+                let (l, r, t, b) = (row[0] as usize, row[1] as usize, row[2] as usize, row[3] as usize);
+                if l < r && t < b {
+                    cfg.mask_rects.push(MaskRect {
+                        left: l,
+                        right: r,
+                        top: t,
+                        bottom: b,
+                        mode: if row[4] == 0 { RectMode::Include } else { RectMode::Exclude },
+                    });
+                }
+            }
+        }
+    }
     Ok(cfg)
 }
 
 // ----- enum tokens -------------------------------------------------------
 
-fn dataset_type_from(s: &str) -> Result<DatasetType> {
-    match s {
-        "attenuation" => Ok(DatasetType::Attenuation),
-        "transmission" => Ok(DatasetType::Transmission),
-        _ => bail!("unknown dataset_type {s:?} in config file"),
-    }
-}
-
-fn beta_loss_from(s: &str) -> Result<BetaLoss> {
-    match s {
-        "frobenius" => Ok(BetaLoss::Frobenius),
-        "kullback-leibler" => Ok(BetaLoss::KullbackLeibler),
-        _ => bail!("unknown beta_loss {s:?} in config file"),
-    }
+fn token<T>(s: &str, name: &str, parse: fn(&str) -> Option<T>) -> Result<T> {
+    parse(s).with_context(|| format!("unknown {name} {s:?} in config file"))
 }
 
 fn colormap_from(s: &str) -> Result<Colormap> {
@@ -254,11 +351,17 @@ mod tests {
     fn round_trip_full() {
         let cfg = AppConfig {
             params: CorrectionParams {
-                dataset_type: DatasetType::Transmission,
-                num_materials: 4,
-                safety_factor: 8.0,
-                beta_loss: BetaLoss::KullbackLeibler,
-                max_iter: 250,
+                input_type: InputType::Attenuation,
+                rank: Rank::Fixed(4),
+                max_rank: 8,
+                spectra: Spectra::Support,
+                dose: Some(37.5),
+                device: Device::Cuda(2),
+                mode: SolveMode::Stream,
+                max_steps: 250,
+                rel_tol: 1e-6,
+                max_passes: 12,
+                compile: Compile::Off,
             },
             distance_m: 23.72,
             offset_us: 9600.0,
@@ -269,6 +372,12 @@ mod tests {
             vmax: 1.75,
             region: Some([10, 200, 20, 180]),
             input_folder: Some(PathBuf::from("/some/data/folder")),
+            mask_rects: vec![
+                MaskRect { left: 1, right: 9, top: 2, bottom: 8, mode: RectMode::Include },
+                MaskRect { left: 3, right: 4, top: 3, bottom: 4, mode: RectMode::Exclude },
+            ],
+            mask_range: Some((0.5, 1.5)),
+            mask_file: Some(PathBuf::from("/some/mask.tif")),
         };
         let path = tmp("full");
         save(&path, &cfg).unwrap();
@@ -286,6 +395,28 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(loaded, cfg);
         assert!(loaded.region.is_none());
+        assert!(loaded.mask_rects.is_empty() && loaded.mask_range.is_none() && loaded.mask_file.is_none());
+        assert_eq!(loaded.params.rank, Rank::Auto);
+        assert!(loaded.params.dose.is_none());
+    }
+
+    #[test]
+    fn loads_a_version1_production_file() {
+        let path = tmp("v1");
+        let file = hdf5::File::create(&path).unwrap();
+        write_u32(&file, "format_version", 1).unwrap();
+        let g = file.create_group("correction").unwrap();
+        write_str(&g, "dataset_type", "attenuation").unwrap();
+        write_u64(&g, "num_materials", 3).unwrap();
+        write_f64(&g, "safety_factor", 16.0).unwrap();
+        write_str(&g, "beta_loss", "frobenius").unwrap();
+        write_u64(&g, "max_iter", 300).unwrap();
+        drop(file);
+        let cfg = load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.params.input_type, InputType::Attenuation);
+        assert_eq!(cfg.params.rank, Rank::Fixed(3));
+        assert_eq!(cfg.params.max_steps, 1000, "NMF-only values are ignored");
     }
 
     #[test]

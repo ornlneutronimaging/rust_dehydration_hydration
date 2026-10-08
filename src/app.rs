@@ -1,15 +1,16 @@
 //! The egui/eframe application: load a TIFF stack, tune the correction
-//! parameters, run the NMF dehydration/hydration denoising on a background
-//! thread, compare corrected vs raw images, inspect region profiles, and
-//! export the corrected stack — the same workflow as the
-//! dehydration_hydration notebook, in one native window.
+//! parameters, run the mbirtorch hsnt dehydration/hydration denoising on a
+//! background thread (a Python subprocess, see [`crate::hsnt_cli`]), compare
+//! corrected vs raw images, inspect region profiles, and export the
+//! corrected stack — the same workflow as the dehydration_hydration
+//! notebook, in one native window.
 
 use crate::colormap::Colormap;
-use crate::correction::{start_correction, CorrectionMsg, CorrectionParams, MATERIALS_FACTOR};
-use crate::export::{start_export, ExportMsg, Provenance};
-use crate::hsnt::{estimate_num_materials, DatasetType, MBIRTORCH_COMMIT, MBIRTORCH_VERSION};
+use crate::correction::{start_correction, CorrectionMsg, CorrectionParams};
+use crate::export::{start_export, ExportMsg, MaskInfo, Provenance};
+use crate::hsnt_cli::{self, Artifact, Compile, Device, HsntReport, InputType, Rank, SolveMode, Spectra};
 use crate::loader::{self, Detector, ImageStack, Selection};
-use crate::nmf::BetaLoss;
+use crate::mask::{self, MaskFile, MaskRect, MaskSpec, RectMode};
 use crate::run_lookup::{self, RunInfo};
 use crate::spectra;
 
@@ -27,12 +28,21 @@ const COLORBAR_WIDTH: f32 = 78.0;
 /// Spatial binning factor of the fast preview run.
 const PREVIEW_BIN: usize = 2;
 
-/// Number of randomly sampled pixel spectra used by the material estimation.
-const ESTIMATE_SAMPLE: usize = 384;
+/// Colors of the profile plot series (fixed, so the legend — sorted by name
+/// — always matches the markers): uncorrected data in orange, corrected in
+/// blue; the single-pixel spectra in lighter tints of the same two.
+const UNCORRECTED_COLOR: Color32 = Color32::from_rgb(255, 140, 0);
+const CORRECTED_COLOR: Color32 = Color32::from_rgb(60, 140, 255);
+const PIXEL_UNCORRECTED_COLOR: Color32 = Color32::from_rgb(255, 200, 120);
+const PIXEL_CORRECTED_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+
+/// Outline colors of the mask rectangles on the integrated image.
+const MASK_INCLUDE_COLOR: Color32 = Color32::from_rgb(80, 220, 80);
+const MASK_EXCLUDE_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
 
 /// ORNL Neutron Imaging team logo (same asset as the other rust
-/// applications) and the MBIRTorch logo (the Purdue library the correction is
-/// a port of), embedded in the binary and shown at the bottom-left of the
+/// applications) and the MBIRTorch logo (the Purdue library that runs the
+/// correction), embedded in the binary and shown at the bottom-left of the
 /// window. The MBIRTorch logo has a light- and a dark-background variant;
 /// the one matching the active theme is displayed. The light one is the
 /// official `docs/source/_static/logo.png` of the mbirtorch repository; the
@@ -50,6 +60,21 @@ fn load_logo(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHan
     let pixels = rgba.into_raw();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
     Some(ctx.load_texture(name, color_image, TextureOptions::LINEAR))
+}
+
+/// Tooltip of each spectra estimator (the CLI's wording, shortened).
+fn spectra_help(s: Spectra) -> &'static str {
+    match s {
+        Spectra::Mle => "mle: the spectra that best fit the measured counts (default)",
+        Spectra::Unconstrained => {
+            "unconstrained: removes a bias the best fit has at low dose; worth it with many \
+             pixels (on a test phantom 7-12 dB at a million pixels, up to 2 dB at 65,000)"
+        }
+        Spectra::Support => {
+            "support: works out which components each pixel contains, which removes the same \
+             bias and zeroes the background of the maps; needs the dose"
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,9 +160,19 @@ struct ResultState {
     binned_raw: Option<Vec<Array2<f32>>>,
     /// Spatial binning factor (1 = full resolution, >1 = preview).
     bin: usize,
-    subspace_dimension: usize,
     elapsed_seconds: f64,
     params: CorrectionParams,
+    /// What mbirtorch reported about the fit.
+    report: HsntReport,
+    /// The run's by-products (report, dehydrated file, plots, log), written
+    /// into the export folder.
+    artifacts: Vec<Artifact>,
+    /// The mask the solver saw (binned for previews), when one was set.
+    mask: Option<Arc<Array2<bool>>>,
+    /// Pixels handed to the solver.
+    n_pixels: usize,
+    /// How the mask was defined, for the provenance file.
+    mask_description: String,
 }
 
 impl ResultState {
@@ -304,8 +339,40 @@ pub struct DehydrationApp {
     corr_job: Option<CorrJob>,
     export_job: Option<ExportJob>,
     last_export: Option<PathBuf>,
-    /// Background material-count estimation ("Auto" button).
-    estimate_job: Option<Receiver<usize>>,
+    /// Every line the mbirtorch command line printed during the last (or
+    /// running) correction, shown by the "📜 Log" window.
+    run_log: Vec<String>,
+    show_log: bool,
+    /// The "📈 Diagnostics" window: the spectra and maps plots of the result.
+    show_diagnostics: bool,
+    /// (spectra, maps) plot textures of the current result, loaded when the
+    /// diagnostics window first opens.
+    diag_tex: Option<[Option<TextureHandle>; 2]>,
+    /// Fixed rank last typed, kept while "auto" is selected.
+    fixed_rank: usize,
+    /// Dose last typed, kept while the dose is unknown.
+    dose_value: f64,
+    /// Commit of the mbirtorch checkout, read once at startup.
+    mbirtorch_commit: Option<String>,
+
+    /// Pixel mask definition (what the Mask section edits).
+    mask_spec: MaskSpec,
+    /// The mask built from `mask_spec` and the integrated image; `None` =
+    /// all pixels (or a build error, kept in `mask_error`).
+    mask: Option<Arc<Array2<bool>>>,
+    mask_dirty: bool,
+    mask_error: Option<String>,
+    /// Tint the excluded pixels on the image panes.
+    show_mask: bool,
+    /// Drag on the integrated image (raw view) adds a mask rectangle.
+    mask_draw: bool,
+    mask_rect_mode: RectMode,
+    /// Rectangle being dragged, image coordinates `[x0, y0, x1, y1]`.
+    mask_drag: Option<[f32; 4]>,
+    /// Range values being edited (kept while the range is disabled).
+    mask_range_values: (f32, f32),
+    /// Value range of the integrated image (bounds of the range controls).
+    integrated_range: (f32, f32),
 
     /// Right pane of the "Corrected vs raw" view.
     right_pane: RightPane,
@@ -390,7 +457,23 @@ impl DehydrationApp {
             corr_job: None,
             export_job: None,
             last_export: None,
-            estimate_job: None,
+            run_log: Vec::new(),
+            show_log: false,
+            show_diagnostics: false,
+            diag_tex: None,
+            fixed_rank: 2,
+            dose_value: 100.0,
+            mbirtorch_commit: hsnt_cli::mbirtorch_commit(),
+            mask_spec: MaskSpec::default(),
+            mask: None,
+            mask_dirty: false,
+            mask_error: None,
+            show_mask: true,
+            mask_draw: false,
+            mask_rect_mode: RectMode::Include,
+            mask_drag: None,
+            mask_range_values: (0.0, 1.0),
+            integrated_range: (0.0, 1.0),
             right_pane: RightPane::Raw,
             tex_left: None,
             tex_right: None,
@@ -424,6 +507,17 @@ impl DehydrationApp {
         self.offset_us = offset_us;
     }
 
+    /// Correction parameters given on the command line.
+    pub fn set_params(&mut self, params: CorrectionParams) {
+        self.params = params;
+        if let Rank::Fixed(n) = params.rank {
+            self.fixed_rank = n;
+        }
+        if let Some(d) = params.dose {
+            self.dose_value = d;
+        }
+    }
+
     /// The two logos, side by side. The MBIRTORCH variant matching the active
     /// theme is shown: the official transparent PNG (dark text) on light,
     /// the white-on-black variant on dark.
@@ -447,7 +541,7 @@ impl DehydrationApp {
             }
             if let Some(tex) = mbirtorch {
                 ui.add(egui::Image::from_texture(&*tex).max_height(LOGO_HEIGHT))
-                    .on_hover_text(format!("MBIRTorch {MBIRTORCH_VERSION} — Purdue University"));
+                    .on_hover_text("MBIRTorch — Purdue University (hsnt package by Harel Dor)");
             }
         });
     }
@@ -462,19 +556,35 @@ impl DehydrationApp {
         }
         let modal = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
             ui.set_max_width(520.0);
-            ui.heading("Dehydration / Hydration Correction");
+            ui.heading("Dehydration / Hydration Correction — beta (mbirtorch hsnt)");
             ui.label(format!("Application version {}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             ui.add_space(4.0);
-            ui.label("The correction is a native Rust port of the dehydrate/rehydrate \
-                      denoising of the mbirtorch library (module mbirtorch.hsnt, function \
-                      hyper_denoise).");
+            ui.label(
+                "This beta runs the new dehydration/hydration of mbirtorch's hsnt package \
+                 (Harel Dor): the maximum-likelihood factorization X = W·H of the \
+                 attenuation under the Poisson statistics of the counts, with the number \
+                 of components estimated by likelihood-ratio tests when it is not given. \
+                 The production tool runs a native port of the earlier least-squares NMF.",
+            );
+            ui.add_space(6.0);
+            ui.label(
+                "The correction is `python -m mbirtorch.hsnt denoise` on the loaded stack, \
+                 in the pixi environment of the checkout below; the stack travels through \
+                 a scratch HDF5 file.",
+            );
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "mbirtorch version: {MBIRTORCH_VERSION}  (commit {MBIRTORCH_COMMIT})"
+                    "mbirtorch checkout: {}\nbranch {}, commit {}",
+                    hsnt_cli::MBIRTORCH_CHECKOUT,
+                    hsnt_cli::MBIRTORCH_BRANCH,
+                    self.mbirtorch_commit.as_deref().unwrap_or("not found")
                 ))
                 .strong(),
+            );
+            ui.label(
+                egui::RichText::new(format!("Python: {}", hsnt_cli::python().display())).small(),
             );
             ui.add_space(6.0);
             ui.label("Algorithm reference:");
@@ -501,6 +611,367 @@ impl DehydrationApp {
         if modal.should_close() {
             self.show_about = false;
         }
+    }
+
+    // ----- mbirtorch log and diagnostics windows -------------------------------
+
+    /// Everything the mbirtorch command line printed (stderr log + stdout).
+    fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.show_log {
+            return;
+        }
+        let running = self.corr_job.is_some();
+        let mut text = self.run_log.join("\n");
+        let n_lines = self.run_log.len();
+        let mut open = true;
+        egui::Window::new("📜 mbirtorch hsnt log")
+            .open(&mut open)
+            .default_size([780.0, 420.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{n_lines} line(s){}",
+                        if running { " — running" } else { "" }
+                    ));
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(running)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            });
+        if !open {
+            self.show_log = false;
+        }
+    }
+
+    /// The spectra and maps PNGs mbirtorch plotted for the current result,
+    /// with its data checks and memory plan.
+    fn diagnostics_window(&mut self, ctx: &egui::Context) {
+        if !self.show_diagnostics {
+            return;
+        }
+        let Some(result) = &self.result else {
+            self.show_diagnostics = false;
+            return;
+        };
+        if self.diag_tex.is_none() {
+            let find = |name: &str| {
+                result
+                    .artifacts
+                    .iter()
+                    .find(|a| a.name == name)
+                    .and_then(|a| load_logo(ctx, &format!("diag_{name}"), &a.bytes))
+            };
+            let textures = [find("hsnt_spectra.png"), find("hsnt_maps.png")];
+            self.diag_tex = Some(textures);
+        }
+        let Some(result) = &self.result else { return };
+        let textures = self.diag_tex.clone().unwrap_or([None, None]);
+        let report = result.report.clone();
+        let mut open = true;
+        egui::Window::new("📈 mbirtorch hsnt diagnostics")
+            .open(&mut open)
+            .default_size([900.0, 700.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                if !report.summary_line.is_empty() {
+                    ui.label(egui::RichText::new(&report.summary_line).small());
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let avail = ui.available_width();
+                    for (title, tex) in [
+                        ("Component spectra", &textures[0]),
+                        ("Component maps", &textures[1]),
+                    ] {
+                        ui.heading(title);
+                        match tex {
+                            Some(tex) => {
+                                ui.add(
+                                    egui::Image::from_texture(tex)
+                                        .max_width(avail)
+                                        .max_height(640.0),
+                                );
+                            }
+                            None => {
+                                ui.weak("not available");
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if !report.checks.is_empty() {
+                        ui.heading("Data checks");
+                        for (level, msg) in &report.checks {
+                            let text = format!("[{level}] {msg}");
+                            match level.as_str() {
+                                "ok" => {
+                                    ui.label(text);
+                                }
+                                "warn" => {
+                                    ui.colored_label(ui.visuals().warn_fg_color, text);
+                                }
+                                _ => {
+                                    ui.colored_label(ui.visuals().error_fg_color, text);
+                                }
+                            }
+                        }
+                    }
+                    if !report.memory_plan.is_empty() {
+                        ui.heading("Memory plan");
+                        ui.label(&report.memory_plan);
+                    }
+                });
+            });
+        if !open {
+            self.show_diagnostics = false;
+        }
+    }
+
+    // ----- mask ----------------------------------------------------------------
+
+    /// Rebuild the pixel mask from its definition and the integrated image
+    /// when either changed.
+    fn rebuild_mask(&mut self) {
+        if !self.mask_dirty {
+            return;
+        }
+        self.mask_dirty = false;
+        let Some(integrated) = &self.integrated_raw else {
+            self.mask = None;
+            self.mask_error = None;
+            return;
+        };
+        match self.mask_spec.build(integrated) {
+            Ok(m) => {
+                self.mask = m.map(Arc::new);
+                self.mask_error = None;
+            }
+            Err(e) => {
+                self.mask = None;
+                self.mask_error = Some(format!("{e:#}"));
+            }
+        }
+        self.tex_dirty = true;
+    }
+
+    /// The mask matching the images on screen: the stack's in the raw view,
+    /// the one the run saw (binned for previews) in the result views.
+    fn display_mask(&self) -> Option<Arc<Array2<bool>>> {
+        match self.view {
+            View::Raw => self.mask.clone(),
+            View::Result | View::Profiles => self.result.as_ref().and_then(|r| r.mask.clone()),
+        }
+    }
+
+    fn load_mask_dialog(&mut self, stack: &ImageStack) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Load a mask image (nonzero = selected pixel)")
+            .add_filter("Mask image", &["tif", "tiff", "npy"]);
+        if let Some(dir) = &self.input_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else { return };
+        match mask::load_file(&path, stack.detector) {
+            Ok(pixels) => {
+                let n = mask::count(&pixels);
+                self.mask_spec.file = Some(MaskFile {
+                    path: path.clone(),
+                    pixels: Arc::new(pixels),
+                });
+                self.mask_dirty = true;
+                self.status = format!("Mask loaded from {} ({n} selected pixel(s))", path.display());
+            }
+            Err(e) => self.status = format!("Loading the mask failed: {e:#}"),
+        }
+    }
+
+    fn save_mask_dialog(&mut self, stack: &ImageStack) {
+        let Some(m) = self.mask.clone() else { return };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save the mask as an 8-bit TIFF (255 = selected pixel)")
+            .add_filter("TIFF", &["tif", "tiff"])
+            .set_file_name("dehydration_hydration_mask.tif");
+        if let Some(dir) = &self.input_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else { return };
+        match mask::save_file(&path, &m, stack.orientation) {
+            Ok(()) => self.status = format!("Mask saved to {}", path.display()),
+            Err(e) => self.status = format!("Saving the mask failed: {e:#}"),
+        }
+    }
+
+    /// The "Mask" section of the left panel.
+    fn mask_section(&mut self, ui: &mut egui::Ui, stack: &ImageStack) {
+        let total = stack.height * stack.width;
+        egui::CollapsingHeader::new(egui::RichText::new("Mask").heading())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Only the selected pixels are sent to mbirtorch; the others keep \
+                         their raw values in the corrected stack. Leave everything off to \
+                         use all pixels.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let running = self.corr_job.is_some();
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .toggle_value(&mut self.mask_draw, "✏ Draw rectangles")
+                            .on_hover_text(
+                                "Drag on the integrated image (right pane of the Raw data \
+                                 view) to add a rectangle",
+                            )
+                            .changed()
+                            && self.mask_draw
+                        {
+                            self.view = View::Raw;
+                            self.tex_dirty = true;
+                        }
+                        egui::ComboBox::from_id_salt("mask_rect_mode")
+                            .selected_text(self.mask_rect_mode.label())
+                            .show_ui(ui, |ui| {
+                                for m in [RectMode::Include, RectMode::Exclude] {
+                                    ui.selectable_value(&mut self.mask_rect_mode, m, m.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "include: keep only the pixels inside (any of) the include \
+                                 rectangles; exclude: drop the pixels inside",
+                            );
+                    });
+                    let mut remove: Option<usize> = None;
+                    for (i, r) in self.mask_spec.rects.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let color = match r.mode {
+                                RectMode::Include => MASK_INCLUDE_COLOR,
+                                RectMode::Exclude => MASK_EXCLUDE_COLOR,
+                            };
+                            ui.colored_label(color, "■");
+                            ui.label(egui::RichText::new(r.label()).small());
+                            if ui.small_button("✖").on_hover_text("Remove this rectangle").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.mask_spec.rects.remove(i);
+                        self.mask_dirty = true;
+                    }
+
+                    let mut has_range = self.mask_spec.range.is_some();
+                    let (lo_all, hi_all) = self.integrated_range;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut has_range, "Integrated value in")
+                            .on_hover_text(
+                                "Keep the pixels whose summed intensity over the stack (the \
+                                 integrated image) lies in this range — e.g. to leave out the \
+                                 open beam around the sample",
+                            )
+                            .changed()
+                        {
+                            self.mask_dirty = true;
+                        }
+                        let speed = ((hi_all - lo_all) / 500.0).max(1e-6);
+                        let (mut lo, mut hi) = self.mask_range_values;
+                        let r1 = ui.add_enabled(
+                            has_range,
+                            egui::DragValue::new(&mut lo).speed(speed).range(lo_all..=hi_all),
+                        );
+                        ui.label("..");
+                        let r2 = ui.add_enabled(
+                            has_range,
+                            egui::DragValue::new(&mut hi).speed(speed).range(lo_all..=hi_all),
+                        );
+                        if r1.changed() || r2.changed() {
+                            if lo > hi {
+                                std::mem::swap(&mut lo, &mut hi);
+                            }
+                            self.mask_range_values = (lo, hi);
+                            self.mask_dirty = true;
+                        }
+                    });
+                    self.mask_spec.range = has_range.then_some(self.mask_range_values);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("📂 Load mask…")
+                            .on_hover_text(
+                                "A mask image (TIFF or .npy, nonzero = selected), read with the \
+                                 stack's detector orientation — e.g. one saved here or made with \
+                                 the Hyperspectral Masker",
+                            )
+                            .clicked()
+                        {
+                            self.load_mask_dialog(stack);
+                        }
+                        if ui
+                            .add_enabled(self.mask.is_some(), egui::Button::new("💾 Save mask…"))
+                            .on_hover_text("Write the current mask as an 8-bit TIFF (255 = selected)")
+                            .clicked()
+                        {
+                            self.save_mask_dialog(stack);
+                        }
+                        if ui
+                            .add_enabled(!self.mask_spec.is_empty(), egui::Button::new("Clear"))
+                            .on_hover_text("Remove every rectangle, the range and the file: all pixels")
+                            .clicked()
+                        {
+                            self.mask_spec = MaskSpec::default();
+                            self.mask_dirty = true;
+                        }
+                    });
+                    if let Some(path) = self.mask_spec.file.as_ref().map(|f| f.path.clone()) {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("file: {}", path.display()))
+                                    .small()
+                                    .weak(),
+                            )
+                            .on_hover_text(path.display().to_string());
+                            if ui.small_button("✖").on_hover_text("Drop the mask file").clicked() {
+                                self.mask_spec.file = None;
+                                self.mask_dirty = true;
+                            }
+                        });
+                    }
+                });
+                if ui
+                    .checkbox(&mut self.show_mask, "Show mask (tint the excluded pixels)")
+                    .changed()
+                {
+                    self.tex_dirty = true;
+                }
+                if let Some(e) = &self.mask_error {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Mask error: {e}"));
+                } else {
+                    match &self.mask {
+                        Some(m) => {
+                            let n = mask::count(m);
+                            ui.label(format!(
+                                "{n} of {total} pixels selected ({:.1}%)",
+                                100.0 * n as f64 / total.max(1) as f64
+                            ));
+                        }
+                        None => {
+                            ui.weak(format!("No mask: all {total} pixels"));
+                        }
+                    }
+                }
+            });
     }
 
     // ----- loading -----------------------------------------------------------
@@ -657,7 +1128,13 @@ impl DehydrationApp {
         for f in &stack.frames {
             acc += f;
         }
+        self.integrated_range = finite_range(&acc);
+        if self.mask_spec.range.is_none() {
+            self.mask_range_values = self.integrated_range;
+        }
         self.integrated_raw = Some(acc);
+        self.mask_dirty = true;
+        self.mask_drag = None;
 
         // TOF axis from the folder's *_Spectra.txt, when it matches the
         // stack (one TOF value per image).
@@ -697,83 +1174,44 @@ impl DehydrationApp {
         );
     }
 
-    // ----- material estimation ("Auto") --------------------------------------
-
-    /// Estimate the number of materials from a random sample of pixel
-    /// spectra, on a background thread (the SVD takes a few seconds).
-    fn start_estimation(&mut self, ctx: &egui::Context) {
-        let Some(stack) = self.stack.clone() else {
-            return;
-        };
-        let dataset_type = self.params.dataset_type;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let (h, w, n) = (stack.height, stack.width, stack.frames.len());
-            let points = h * w;
-            let sample_size = ESTIMATE_SAMPLE.min(points);
-            let mut rng = crate::linalg::Rng::new(0xE571_AA7E);
-            let mut sample = Array2::<f64>::zeros((sample_size, n));
-            for row in 0..sample_size {
-                let p = (rng.next_u64() % points as u64) as usize;
-                let (y, x) = (p / w, p % w);
-                for (i, frame) in stack.frames.iter().enumerate() {
-                    let mut v = f64::from(frame[(y, x)]);
-                    // Same preprocessing as dehydrate(): the estimation runs
-                    // in the attenuation domain.
-                    if dataset_type == DatasetType::Transmission {
-                        v = -v.max(1e-3).ln();
-                    }
-                    sample[(row, i)] = v.max(0.0);
-                }
-            }
-            let estimate = estimate_num_materials(sample.view());
-            let _ = tx.send(estimate);
-            ctx.request_repaint();
-        });
-        self.estimate_job = Some(rx);
-        self.status = "Estimating the number of materials…".to_owned();
-    }
-
-    fn poll_estimation(&mut self) {
-        let Some(rx) = &self.estimate_job else { return };
-        if let Ok(estimate) = rx.try_recv() {
-            self.estimate_job = None;
-            self.params.num_materials = estimate.clamp(1, 10);
-            self.status = format!(
-                "Estimated {estimate} material(s) from {ESTIMATE_SAMPLE} sampled pixel spectra \
-                 (×{MATERIALS_FACTOR} → subspace dimension {}).",
-                self.params.to_hsnt().subspace_dimension()
-            );
-        }
-    }
-
     // ----- correction job ----------------------------------------------------
 
     fn start_correction_job(&mut self, ctx: &egui::Context, bin: usize) {
         let Some(stack) = &self.stack else { return };
+        if let Err(e) = self.params.validate() {
+            self.status = format!("Cannot run: {e}");
+            return;
+        }
+        if let Some(e) = &self.mask_error {
+            self.status = format!("Cannot run: mask error — {e}");
+            return;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = start_correction(stack.clone(), self.params, bin, cancel.clone(), ctx.clone());
+        let rx = start_correction(
+            stack.clone(),
+            self.params,
+            bin,
+            self.mask.clone(),
+            cancel.clone(),
+            ctx.clone(),
+        );
         self.corr_job = Some(CorrJob {
             rx,
             stage: "Starting…".to_owned(),
             fraction: 0.0,
             cancel,
         });
+        self.run_log.clear();
         let mode = if bin > 1 {
             format!("preview, {bin}×{bin} binned, ")
         } else {
             String::new()
         };
-        self.status = format!(
-            "Correction running ({mode}{}, {} materials ×{MATERIALS_FACTOR} → {}, {}, {} \
-             iterations max)…",
-            self.params.dataset_type.label(),
-            self.params.num_materials,
-            self.params.num_materials * MATERIALS_FACTOR,
-            self.params.beta_loss.label(),
-            self.params.max_iter,
-        );
+        let masked = match &self.mask {
+            Some(m) => format!(", {} of {} px", mask::count(m), m.len()),
+            None => String::new(),
+        };
+        self.status = format!("Correction running ({mode}{}{masked})…", self.params.summary());
     }
 
     fn poll_correction(&mut self) {
@@ -785,6 +1223,7 @@ impl DehydrationApp {
                         job.stage = stage;
                         job.fraction = fraction;
                     }
+                    CorrectionMsg::Log(line) => self.run_log.push(line),
                     CorrectionMsg::Done(res) => done = Some(res),
                 }
             }
@@ -799,19 +1238,39 @@ impl DehydrationApp {
                 } else {
                     String::new()
                 };
+                let rank = out
+                    .report
+                    .rank
+                    .map(|r| format!("rank {r}"))
+                    .unwrap_or_else(|| "rank unknown".to_owned());
+                let chi2 = out
+                    .report
+                    .reduced_chi2
+                    .map(|c| format!(", reduced chi-square {c:.2}"))
+                    .unwrap_or_default();
+                let warn = if out.report.warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {} warning(s), see the log", out.report.warnings.len())
+                };
                 self.status = format!(
-                    "Correction done in {:.1} s (subspace dimension {}){preview_note}.",
-                    out.elapsed_seconds, out.subspace_dimension
+                    "Correction done in {:.1} s ({rank}{chi2}){preview_note}{warn}.",
+                    out.elapsed_seconds
                 );
                 self.result = Some(ResultState {
                     frames: Arc::new(out.frames),
                     integrated_mean: out.integrated_mean,
                     binned_raw: out.binned_raw,
                     bin: out.bin,
-                    subspace_dimension: out.subspace_dimension,
                     elapsed_seconds: out.elapsed_seconds,
                     params: self.params,
+                    report: out.report,
+                    artifacts: out.artifacts,
+                    mask: out.mask.map(Arc::new),
+                    n_pixels: out.n_pixels,
+                    mask_description: self.mask_spec.describe(),
                 });
+                self.diag_tex = None;
                 self.pixel_marker = None;
                 self.pixel_profiles = None;
                 // The notebook's default profile region: the second quarter
@@ -833,7 +1292,10 @@ impl DehydrationApp {
             Err(e) if e.contains("cancelled") => {
                 self.status = "Correction cancelled.".to_owned();
             }
-            Err(e) => self.status = format!("Correction failed: {e}"),
+            Err(e) => {
+                self.status = format!("Correction failed: {e}");
+                self.show_log = true;
+            }
         }
     }
 
@@ -868,9 +1330,15 @@ impl DehydrationApp {
             image_width: w,
             image_height: h,
             params: result.params,
-            subspace_dimension: result.subspace_dimension,
             bin: result.bin,
             elapsed_seconds: result.elapsed_seconds,
+            report: result.report.clone(),
+            mbirtorch_commit: self.mbirtorch_commit.clone(),
+            mask: result.mask.as_ref().map(|m| MaskInfo {
+                selected: result.n_pixels,
+                total: m.len(),
+                description: result.mask_description.clone(),
+            }),
         };
         let rx = start_export(
             output_dir,
@@ -879,6 +1347,7 @@ impl DehydrationApp {
             stack.sources.clone(),
             stack.orientation,
             provenance,
+            result.artifacts.clone(),
             ctx.clone(),
         );
         self.export_job = Some(ExportJob {
@@ -1105,8 +1574,8 @@ impl DehydrationApp {
             }
         }
         let (vmin, vmax) = (self.vmin, self.vmax);
-        let left_color = left.as_ref().map(|img| colorize(img, vmin, vmax, &lut));
-        let right_color = right.as_ref().map(|img| {
+        let mut left_color = left.as_ref().map(|img| colorize(img, vmin, vmax, &lut));
+        let mut right_color = right.as_ref().map(|img| {
             let (lo, hi) = if right_is_diff {
                 // Symmetric range around 0: structure in the difference
                 // stands out regardless of sign.
@@ -1123,6 +1592,18 @@ impl DehydrationApp {
             };
             colorize(img, lo, hi, &lut)
         });
+        if self.show_mask
+            && let Some(m) = self.display_mask()
+        {
+            if let Some(c) = left_color.as_mut() {
+                tint_excluded(c, &m);
+            }
+            if let Some(c) = right_color.as_mut()
+                && !right_is_diff
+            {
+                tint_excluded(c, &m);
+            }
+        }
         self.pane_cache = (left, right);
 
         self.tex_left =
@@ -1738,6 +2219,9 @@ impl DehydrationApp {
                 .region
                 .map(|r| [r.left, r.right, r.top, r.bottom]),
             input_folder: self.input_dir.clone(),
+            mask_rects: self.mask_spec.rects.clone(),
+            mask_range: self.mask_spec.range,
+            mask_file: self.mask_spec.file.as_ref().map(|f| f.path.clone()),
         }
     }
 
@@ -1762,6 +2246,34 @@ impl DehydrationApp {
             }
             self.region = Some(region);
         }
+        // The mask definition; a mask file is re-read with the loaded
+        // stack's orientation (it needs a stack to line up with).
+        self.mask_spec.rects = cfg.mask_rects.clone();
+        self.mask_spec.range = cfg.mask_range;
+        if let Some(range) = cfg.mask_range {
+            self.mask_range_values = range;
+        }
+        self.mask_spec.file = None;
+        if let Some(path) = &cfg.mask_file {
+            match &self.stack {
+                Some(stack) => match mask::load_file(path, stack.detector) {
+                    Ok(pixels) => {
+                        self.mask_spec.file = Some(MaskFile {
+                            path: path.clone(),
+                            pixels: Arc::new(pixels),
+                        });
+                    }
+                    Err(e) => self.mask_error = Some(format!("mask file of the config: {e:#}")),
+                },
+                None => {
+                    self.mask_error = Some(format!(
+                        "the config names a mask file ({}): load the data first, then load the config again",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        self.mask_dirty = true;
         self.tex_dirty = true;
         self.profiles_dirty = true;
     }
@@ -1807,12 +2319,37 @@ impl DehydrationApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("ℹ mbirtorch")
-                    .on_hover_text(format!(
-                        "Algorithm provenance — native port of mbirtorch {MBIRTORCH_VERSION}"
-                    ))
+                    .on_hover_text("Algorithm provenance — the mbirtorch hsnt branch this beta runs")
                     .clicked()
                 {
                     self.show_about = true;
+                }
+                let has_plots = self
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| r.artifacts.iter().any(|a| a.name.ends_with(".png")));
+                if ui
+                    .add_enabled(has_plots, egui::Button::new("📈 Diagnostics"))
+                    .on_hover_text(
+                        "The component spectra and maps plotted by mbirtorch for the current \
+                         result, and its data checks",
+                    )
+                    .on_disabled_hover_text("Available once a correction has run")
+                    .clicked()
+                {
+                    self.show_diagnostics = !self.show_diagnostics;
+                }
+                let has_log = !self.run_log.is_empty();
+                if ui
+                    .add_enabled(has_log, egui::Button::new("📜 Log"))
+                    .on_hover_text(
+                        "Everything the mbirtorch command line printed during the last \
+                         correction",
+                    )
+                    .on_disabled_hover_text("No correction has run yet")
+                    .clicked()
+                {
+                    self.show_log = !self.show_log;
                 }
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -2005,10 +2542,14 @@ impl DehydrationApp {
             let (n, h, w) = (stack.n_frames(), stack.height, stack.width);
             ui.label(format!("{n} images of {w}×{h} px"));
             ui.label(format!(
-                "In memory: {} (f32), correction needs ≈{} more",
+                "In memory: {} (f32); the exchange file for mbirtorch is as large",
                 fmt_bytes(n as u64 * (h * w) as u64 * 4),
-                // (points × bands) f64 working matrix + f32 corrected stack
-                fmt_bytes(n as u64 * (h * w) as u64 * 12),
+            ))
+            .on_hover_text(format!(
+                "The stack is handed to mbirtorch through a scratch HDF5 file in {} \
+                 (override with {}), removed after the run",
+                hsnt_cli::scratch_root().display(),
+                hsnt_cli::SCRATCH_ENV_VAR
             ));
             if stack.nonfinite_fixed > 0 {
                 ui.colored_label(
@@ -2036,77 +2577,192 @@ impl DehydrationApp {
             ui.separator();
         }
 
+        if let Some(stack) = self.stack.clone() {
+            self.mask_section(ui, &stack);
+            ui.add_space(6.0);
+            ui.separator();
+        }
+
         ui.heading("Correction parameters");
+        ui.label(
+            egui::RichText::new("mbirtorch.hsnt denoise — maximum-likelihood factorization")
+                .small()
+                .weak(),
+        );
         ui.add_space(4.0);
 
         let running = self.corr_job.is_some();
         ui.add_enabled_ui(!running, |ui| {
-            egui::ComboBox::from_label("Dataset type")
-                .selected_text(self.params.dataset_type.label())
+            egui::ComboBox::from_label("Input type")
+                .selected_text(self.params.input_type.label())
                 .show_ui(ui, |ui| {
-                    for t in [DatasetType::Attenuation, DatasetType::Transmission] {
-                        ui.selectable_value(&mut self.params.dataset_type, t, t.label());
+                    for t in InputType::ALL {
+                        ui.selectable_value(&mut self.params.input_type, t, t.label());
                     }
                 });
-            ui.label("attenuation = −log(transmission)")
-                .on_hover_text("Pick 'transmission' when the images are normalized transmission data");
+            ui.label(
+                egui::RichText::new(
+                    "transmission = normalized data (the usual case); attenuation = \
+                     −log(transmission); auto infers it from the values",
+                )
+                .small()
+                .weak(),
+            );
             ui.add_space(6.0);
 
+            // Rank: estimated by the CLI, or given.
+            let mut auto = self.params.rank == Rank::Auto;
+            if let Rank::Fixed(n) = self.params.rank {
+                self.fixed_rank = n;
+            }
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::Slider::new(&mut self.params.num_materials, 1..=10)
-                        .text("Number of materials"),
-                )
-                .on_hover_text(format!(
-                    "How many different materials the data set contains; the correction \
-                     receives ×{MATERIALS_FACTOR} this value to keep extra degrees of freedom"
-                ));
-                let estimating = self.estimate_job.is_some();
-                let ctx = ui.ctx().clone();
-                if estimating {
-                    ui.spinner();
-                } else if ui
-                    .add_enabled(self.stack.is_some(), egui::Button::new("Auto"))
+                ui.label("Rank");
+                if ui
+                    .selectable_label(auto, "auto")
                     .on_hover_text(
-                        "Estimate from the data: fits a noise model to the singular values \
-                         of sampled pixel spectra and counts the ones above it",
+                        "Estimate the number of components from the data by likelihood-ratio \
+                         tests (at full resolution and on pooled pixels)",
                     )
                     .clicked()
                 {
-                    self.start_estimation(&ctx);
+                    auto = true;
                 }
+                if ui
+                    .selectable_label(!auto, "fixed")
+                    .on_hover_text("Give the number of components yourself")
+                    .clicked()
+                {
+                    auto = false;
+                }
+                ui.add_enabled(
+                    !auto,
+                    egui::DragValue::new(&mut self.fixed_rank).range(1..=50).speed(0.1),
+                );
             });
-            ui.add(
-                egui::Slider::new(&mut self.params.safety_factor, 1.0..=64.0)
-                    .step_by(1.0)
-                    .fixed_decimals(0)
-                    .text("Safety factor"),
-            )
-            .on_hover_text(
-                "Multiplier on the material count (after the ×4) giving the NMF \
-                 subspace dimension — larger keeps more degrees of freedom",
+            ui.label(
+                egui::RichText::new(
+                    "Number of components ≈ number of distinct materials; the components \
+                     span the materials' spectra but need not be the materials themselves",
+                )
+                .small()
+                .weak(),
             );
-            let subdim = self.params.to_hsnt().subspace_dimension();
-            let subdim = match &self.stack {
-                Some(s) => subdim.min(s.n_frames()).max(1),
-                None => subdim,
+            if auto {
+                ui.add(egui::Slider::new(&mut self.params.max_rank, 1..=12).text("Max rank"))
+                    .on_hover_text("Largest number of components the estimate considers");
+            }
+            self.params.rank = if auto {
+                Rank::Auto
+            } else {
+                Rank::Fixed(self.fixed_rank.max(1))
             };
-            ui.weak(format!(
-                "×{MATERIALS_FACTOR} applied internally → {} passed to the correction \
-                 → subspace dimension {subdim}",
-                self.params.num_materials * MATERIALS_FACTOR
-            ));
+            ui.add_space(6.0);
 
-            egui::ComboBox::from_label("Beta loss")
-                .selected_text(self.params.beta_loss.label())
+            egui::ComboBox::from_label("Spectra")
+                .selected_text(self.params.spectra.label())
                 .show_ui(ui, |ui| {
-                    for b in [BetaLoss::Frobenius, BetaLoss::KullbackLeibler] {
-                        ui.selectable_value(&mut self.params.beta_loss, b, b.label());
+                    for s in Spectra::ALL {
+                        ui.selectable_value(&mut self.params.spectra, s, s.label())
+                            .on_hover_text(spectra_help(s));
                     }
-                });
+                })
+                .response
+                .on_hover_text(spectra_help(self.params.spectra));
 
-            ui.add(egui::Slider::new(&mut self.params.max_iter, 50..=1000).text("Max iterations"))
-                .on_hover_text("Maximum iterations for the NMF solver");
+            // Dose: optional.
+            let mut has_dose = self.params.dose.is_some();
+            if let Some(d) = self.params.dose {
+                self.dose_value = d;
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut has_dose, "Dose known").on_hover_text(
+                    "Open-beam counts per pixel and bin. When given, the fit reports a \
+                     reduced chi-square against the Poisson noise; required by the \
+                     'support' spectra",
+                );
+                ui.add_enabled(
+                    has_dose,
+                    egui::DragValue::new(&mut self.dose_value)
+                        .range(1e-6..=1e12)
+                        .speed(1.0)
+                        .suffix(" counts"),
+                );
+            });
+            self.params.dose = has_dose.then_some(self.dose_value);
+            if self.params.spectra == Spectra::Support && !has_dose {
+                ui.colored_label(ui.visuals().warn_fg_color, "The 'support' spectra need the dose.");
+            }
+            ui.add_space(6.0);
+
+            egui::ComboBox::from_label("Device")
+                .selected_text(self.params.device.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.params.device, Device::Auto, "auto");
+                    ui.selectable_value(&mut self.params.device, Device::Cpu, "cpu");
+                    for n in 0..4u8 {
+                        ui.selectable_value(
+                            &mut self.params.device,
+                            Device::Cuda(n),
+                            Device::Cuda(n).label(),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text("auto = the first CUDA GPU when there is one, else the CPU");
+
+            ui.collapsing("Advanced (solver)", |ui| {
+                egui::ComboBox::from_label("Mode")
+                    .selected_text(self.params.mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in SolveMode::ALL {
+                            ui.selectable_value(&mut self.params.mode, m, m.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "full: the whole solve on the device; stream: by chunks of pixels \
+                         (less memory, polish passes); auto: full when the device has the \
+                         memory",
+                    );
+                ui.horizontal(|ui| {
+                    ui.label("Max steps");
+                    ui.add(egui::DragValue::new(&mut self.params.max_steps).range(1..=100_000))
+                        .on_hover_text("Solver step cap of a full solve (default 1000)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Rel. tol.");
+                    ui.add(
+                        egui::DragValue::new(&mut self.params.rel_tol)
+                            .range(0.0..=1.0)
+                            .speed(0.0)
+                            .custom_formatter(|v, _| format!("{v:.0e}")),
+                    )
+                    .on_hover_text(
+                        "Relative loss change per step; the solve stops after five steps in \
+                         a row below it (default 1e-8; type a value such as 1e-6)",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Max passes");
+                    ui.add(egui::DragValue::new(&mut self.params.max_passes).range(0..=200))
+                        .on_hover_text(
+                            "Stream mode: polish passes over the data after the fit on a \
+                             pixel subsample (default 5; more passes trade time for SNR)",
+                        );
+                });
+                egui::ComboBox::from_label("Compile")
+                    .selected_text(self.params.compile.label())
+                    .show_ui(ui, |ui| {
+                        for c in Compile::ALL {
+                            ui.selectable_value(&mut self.params.compile, c, c.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "torch.compile of the solver kernels: auto compiles on CUDA for \
+                         large data only",
+                    );
+            });
         });
 
         ui.add_space(8.0);
@@ -2114,19 +2770,35 @@ impl DehydrationApp {
         if let Some(job) = &self.corr_job {
             ui.add(
                 egui::ProgressBar::new(job.fraction)
-                    .show_percentage()
+                    .animate(true)
                     .text(job.stage.clone()),
             );
-            if ui.button("✖ Cancel").clicked() {
-                job.cancel.store(true, Ordering::Relaxed);
+            if let Some(last) = self.run_log.last() {
+                ui.label(
+                    egui::RichText::new(hsnt_cli::strip_log_prefix(last))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text(
+                    "Last line of the mbirtorch log (📜 Log in the toolbar shows all of it)",
+                );
             }
+            ui.horizontal(|ui| {
+                if ui.button("✖ Cancel").clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                if ui.button("📜 Log").clicked() {
+                    self.show_log = !self.show_log;
+                }
+            });
         } else {
             let can_run = self.stack.is_some() && self.loading.is_none();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(can_run, egui::Button::new("▶ Perform correction"))
                     .on_hover_text(
-                        "Runs the NMF dehydration/hydration denoising on the whole stack",
+                        "Runs mbirtorch-hsnt denoise on the whole stack (dehydration + \
+                         rehydration)",
                     )
                     .clicked()
                 {
@@ -2136,7 +2808,7 @@ impl DehydrationApp {
                     .add_enabled(can_run, egui::Button::new("⚡ Preview"))
                     .on_hover_text(format!(
                         "Fast preview on {PREVIEW_BIN}×{PREVIEW_BIN}-binned pixels (~{}× \
-                         faster) for parameter tuning; previews cannot be exported",
+                         fewer pixels) for parameter tuning; previews cannot be exported",
                         PREVIEW_BIN * PREVIEW_BIN
                     ))
                     .clicked()
@@ -2154,20 +2826,80 @@ impl DehydrationApp {
             } else {
                 ui.heading("Result");
             }
+            let r = &result.report;
+            match r.rank {
+                Some(rank) => {
+                    ui.label(format!("Rank {rank}")).on_hover_text(if r.rank_note.is_empty() {
+                        "number of components"
+                    } else {
+                        r.rank_note.as_str()
+                    });
+                }
+                None => {
+                    ui.label("Rank: not reported");
+                }
+            }
+            if !r.rank_note.is_empty() {
+                ui.label(egui::RichText::new(&r.rank_note).small().weak());
+            }
+            let mut solve = format!(
+                "{} solve",
+                if r.mode.is_empty() { "?" } else { r.mode.as_str() }
+            );
+            if let Some(n) = r.steps {
+                solve.push_str(&format!(", {n} steps"));
+            }
+            if let Some(t) = r.solve_seconds {
+                solve.push_str(&format!(", {t:.1} s"));
+            }
+            if let Some(l) = r.loss {
+                solve.push_str(&format!(", loss {l:.6}"));
+            }
+            ui.label(solve);
+            match r.reduced_chi2 {
+                Some(chi2) => {
+                    let text = format!("Reduced chi-square {chi2:.3}");
+                    let verdict = r.chi2_verdict().unwrap_or("");
+                    if (0.5..=2.0).contains(&chi2) {
+                        ui.label(text).on_hover_text(verdict);
+                    } else {
+                        ui.colored_label(ui.visuals().warn_fg_color, text)
+                            .on_hover_text(verdict);
+                    }
+                    ui.label(egui::RichText::new(verdict).small().weak());
+                }
+                None => {
+                    if let Some(res) = r.relative_residual {
+                        ui.label(format!("Relative residual in transmission {res:.4}"))
+                            .on_hover_text(
+                                "No dose given, so no chi-square against the Poisson noise",
+                            );
+                    }
+                }
+            }
+            if !r.warnings.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} warning(s) from mbirtorch — see 📜 Log", r.warnings.len()),
+                )
+                .on_hover_text(r.warnings.join("\n"));
+            }
             ui.label(format!(
-                "{} materials (×{MATERIALS_FACTOR} → {}) → subspace dimension {}",
-                result.params.num_materials,
-                result.params.num_materials * MATERIALS_FACTOR,
-                result.subspace_dimension
-            ));
-            ui.label(format!(
-                "{} · {} · safety factor {} · {} iterations max",
-                result.params.dataset_type.label(),
-                result.params.beta_loss.label(),
-                result.params.safety_factor,
-                result.params.max_iter
+                "{} · spectra {} · device {}",
+                result.params.input_type.label(),
+                result.params.spectra.label(),
+                result.params.device.label()
             ));
             ui.label(format!("Computed in {:.1} s", result.elapsed_seconds));
+            if let Some(m) = &result.mask {
+                ui.label(format!(
+                    "Mask: {} of {} pixels ({:.1}%) solved; the others keep their raw values",
+                    result.n_pixels,
+                    m.len(),
+                    100.0 * result.n_pixels as f64 / m.len().max(1) as f64
+                ))
+                .on_hover_text(&result.mask_description);
+            }
             if self.params != result.params {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -2323,6 +3055,19 @@ impl DehydrationApp {
         let view_h =
             (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(160.0);
 
+        // Mask rectangles are drawn (and shown) on the integrated image, the
+        // right pane of the raw view. The drag is tracked in local state and
+        // committed after the panes are laid out.
+        let draw_mask = self.mask_draw && self.view == View::Raw;
+        let rects: Vec<MaskRect> = if self.view == View::Raw && (self.show_mask || draw_mask) {
+            self.mask_spec.rects.clone()
+        } else {
+            Vec::new()
+        };
+        let rect_mode = self.mask_rect_mode;
+        let mut drag = self.mask_drag;
+        let mut committed: Option<MaskRect> = None;
+
         ui.horizontal_top(|ui| {
             let avail = ui.available_size();
             let view_w = (avail.x - COLORBAR_WIDTH - ui.spacing().item_spacing.x).max(50.0);
@@ -2349,17 +3094,84 @@ impl DehydrationApp {
                 let mut wheel_zoom: Option<(egui::Vec2, f32)> = None;
                 let out = scroll.show(ui, |ui| {
                     ui.horizontal_top(|ui| {
-                        let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
+                        let scale = self.scale;
+                        let size = egui::vec2(w as f32 * scale, h as f32 * scale);
                         let mut cursor = None;
                         for (k, (tex, img)) in panes.iter().enumerate() {
                             let Some(tex) = tex else { continue };
-                            let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+                            let mask_pane = k == 1;
+                            let sense = if draw_mask && mask_pane {
+                                Sense::click_and_drag()
+                            } else {
+                                Sense::hover()
+                            };
+                            let (rect, response) = ui.allocate_exact_size(size, sense);
                             let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                            ui.painter_at(rect)
-                                .image(tex.id(), rect, full_uv, Color32::WHITE);
+                            let painter = ui.painter_at(rect);
+                            painter.image(tex.id(), rect, full_uv, Color32::WHITE);
+                            let to_img = |p: Pos2| -> (f32, f32) {
+                                ((p.x - rect.left()) / scale, (p.y - rect.top()) / scale)
+                            };
+                            let to_screen = |ix: f32, iy: f32| -> Pos2 {
+                                Pos2::new(rect.left() + ix * scale, rect.top() + iy * scale)
+                            };
+
+                            if mask_pane {
+                                for r in &rects {
+                                    let color = match r.mode {
+                                        RectMode::Include => MASK_INCLUDE_COLOR,
+                                        RectMode::Exclude => MASK_EXCLUDE_COLOR,
+                                    };
+                                    painter.rect_stroke(
+                                        Rect::from_min_max(
+                                            to_screen(r.left as f32, r.top as f32),
+                                            to_screen(r.right as f32, r.bottom as f32),
+                                        ),
+                                        egui::CornerRadius::ZERO,
+                                        Stroke::new(1.5, color),
+                                        egui::StrokeKind::Middle,
+                                    );
+                                }
+                                if draw_mask {
+                                    if response.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                    }
+                                    if response.drag_started()
+                                        && let Some(sp) = ui
+                                            .ctx()
+                                            .input(|i| i.pointer.press_origin())
+                                            .or_else(|| response.interact_pointer_pos())
+                                    {
+                                        let p = to_img(sp);
+                                        drag = Some([p.0, p.1, p.0, p.1]);
+                                    }
+                                    if (response.dragged() || response.drag_stopped())
+                                        && let (Some(d), Some(sp)) =
+                                            (drag.as_mut(), response.interact_pointer_pos())
+                                    {
+                                        let p = to_img(sp);
+                                        d[2] = p.0;
+                                        d[3] = p.1;
+                                    }
+                                    if let Some(d) = drag {
+                                        painter.rect_stroke(
+                                            Rect::from_two_pos(to_screen(d[0], d[1]), to_screen(d[2], d[3])),
+                                            egui::CornerRadius::ZERO,
+                                            Stroke::new(2.0, Color32::YELLOW),
+                                            egui::StrokeKind::Middle,
+                                        );
+                                    }
+                                    if response.drag_stopped()
+                                        && let Some(d) = drag.take()
+                                    {
+                                        committed =
+                                            MaskRect::from_corners((d[0], d[1]), (d[2], d[3]), w, h, rect_mode);
+                                    }
+                                }
+                            }
+
                             if let (Some(p), Some(img)) = (response.hover_pos(), img) {
-                                let fx = (p.x - rect.left()) / self.scale;
-                                let fy = (p.y - rect.top()) / self.scale;
+                                let (fx, fy) = to_img(p);
                                 let ix = fx.floor() as i64;
                                 let iy = fy.floor() as i64;
                                 if ix >= 0 && iy >= 0 && (ix as usize) < w && (iy as usize) < h {
@@ -2391,6 +3203,12 @@ impl DehydrationApp {
 
             self.colorbar(ui, view_h);
         });
+
+        self.mask_drag = drag;
+        if let Some(r) = committed {
+            self.mask_spec.rects.push(r);
+            self.mask_dirty = true;
+        }
     }
 
     /// Profiles view: the integrated corrected image with a draggable region
@@ -2586,26 +3404,34 @@ impl DehydrationApp {
                         plot = plot
                             .y_axis_formatter(|mark, _| fmt_axis(10f64.powf(mark.value)));
                     }
+                    // Explicit colors (never egui_plot's automatic ones, which
+                    // are handed out in insertion order while the legend is
+                    // sorted by name) and the marker glyph in each legend
+                    // entry, so the legend cannot be read the wrong way round.
                     plot.show(ui, |plot_ui| {
                         plot_ui.points(
-                            Points::new("Uncorrected profile", uncorr)
+                            Points::new("Uncorrected profile  ✕", uncorr)
                                 .shape(MarkerShape::Cross)
+                                .color(UNCORRECTED_COLOR)
                                 .radius(3.0),
                         );
                         plot_ui.points(
-                            Points::new("Corrected profile", corr)
+                            Points::new("Corrected profile  ●", corr)
                                 .shape(MarkerShape::Circle)
+                                .color(CORRECTED_COLOR)
                                 .radius(2.5),
                         );
                         if let Some((pu, pc)) = pixel_series {
                             plot_ui.points(
-                                Points::new("Pixel uncorrected", pu)
+                                Points::new("Pixel uncorrected  ✱", pu)
                                     .shape(MarkerShape::Asterisk)
+                                    .color(PIXEL_UNCORRECTED_COLOR)
                                     .radius(2.0),
                             );
                             plot_ui.points(
-                                Points::new("Pixel corrected", pc)
+                                Points::new("Pixel corrected  ◆", pc)
                                     .shape(MarkerShape::Diamond)
+                                    .color(PIXEL_CORRECTED_COLOR)
                                     .radius(2.0),
                             );
                         }
@@ -2927,6 +3753,24 @@ fn colorize(img: &Array2<f32>, vmin: f32, vmax: f32, lut: &[[u8; 3]; 256]) -> eg
     egui::ColorImage::from_rgba_unmultiplied([w, h], &buf)
 }
 
+/// Darken and redden the pixels the mask excludes (sizes must match, else
+/// the image is left alone).
+fn tint_excluded(img: &mut egui::ColorImage, mask: &Array2<bool>) {
+    if img.size != [mask.ncols(), mask.nrows()] {
+        return;
+    }
+    for (px, &keep) in img.pixels.iter_mut().zip(mask.iter()) {
+        if !keep {
+            let [r, g, b, _] = px.to_array();
+            *px = Color32::from_rgb(
+                (f32::from(r) * 0.3 + 110.0 * 0.7) as u8,
+                (f32::from(g) * 0.3) as u8,
+                (f32::from(b) * 0.3 + 40.0 * 0.7) as u8,
+            );
+        }
+    }
+}
+
 /// Human-readable byte count (KB/MB/GB, decimal).
 fn fmt_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
@@ -2983,15 +3827,11 @@ impl eframe::App for DehydrationApp {
         self.poll_run_lookup(&ctx);
         self.poll_correction();
         self.poll_export();
-        self.poll_estimation();
-        if self.loading.is_some()
-            || self.corr_job.is_some()
-            || self.export_job.is_some()
-            || self.estimate_job.is_some()
-        {
+        if self.loading.is_some() || self.corr_job.is_some() || self.export_job.is_some() {
             ctx.request_repaint();
         }
         self.recompute_profiles();
+        self.rebuild_mask();
         self.ensure_textures(&ctx);
         self.handle_drops(&ctx);
 
@@ -3026,5 +3866,7 @@ impl eframe::App for DehydrationApp {
 
         self.run_dialog(&ctx);
         self.about_modal(&ctx);
+        self.log_window(&ctx);
+        self.diagnostics_window(&ctx);
     }
 }

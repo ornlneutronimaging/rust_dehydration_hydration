@@ -1,107 +1,161 @@
-# Dehydration / Hydration Correction
+# Dehydration / Hydration Correction — beta (mbirtorch hsnt)
 
-Native GUI (Rust, [egui](https://github.com/emilk/egui)) that reproduces the
-VENUS **dehydration_hydration** notebook
-(`python_notebooks/notebooks/dehydration_hydration.ipynb`): denoise a stack of
-neutron images with the NMF **dehydrate / rehydrate** algorithm of
-`mbirtorch.hsnt.hyper_denoise`, compare the corrected and raw data, and export
-the corrected stack as 32-bit float TIFFs.
+**This is the beta checkout** (`rust_dehydration_hydration_development`,
+branch `mbirtorch_hsnt`) of the VENUS dehydration/hydration tool. It keeps the
+production GUI (load a stack, compare corrected vs raw, profiles, export) but
+replaces the correction engine: instead of the native Rust port of the
+earlier least-squares NMF `hyper_denoise`, it runs the **new
+dehydration/hydration of mbirtorch's `hsnt` package by Harel Dor** — the
+maximum-likelihood factorization X = W·H of the attenuation under the Poisson
+statistics of the counts, with the number of components estimated by
+likelihood-ratio tests when it is not given. The production tool is
+`../rust_dehydration_hydration` and is not affected.
 
 Algorithm reference: M. S. N. Chowdhury, D. Yang, S. Tang,
 S. V. Venkatakrishnan, H. Z. Bilheux, G. T. Buzzard, and C. A. Bouman,
 "Fast Hyperspectral Neutron Tomography," *IEEE Transactions on Computational
 Imaging*, vol. 11, pp. 663–677, 2025.
 [doi:10.1109/TCI.2025.3567854](https://doi.org/10.1109/TCI.2025.3567854) —
-[mbirtorch documentation](https://mbirtorch.readthedocs.io/en/latest/usr_hsnt.html).
+the estimator here is Harel Dor's maximum-likelihood fit (mbirtorch
+`docs/source/usr_hsnt.rst`), not the paper's NMF.
+
+## How the correction runs
+
+The correction is **not computed in Rust**. The loaded (and detector-oriented)
+stack is written to a scratch HDF5 file in the hsnt layout (`data` of shape
+rows × cols × images, float32, the image index being the spectral axis),
+then
+
+```bash
+python -m mbirtorch.hsnt denoise <scratch>/input.h5 -o <scratch>/out \
+    --input-type transmission --rank auto --max-rank 6 --spectra mle \
+    --device auto --mode auto --max-steps 1000 --rel-tol 1e-8 --max-passes 5 \
+    --compile auto [--dose D] -v
+```
+
+runs in the pixi environment of the sibling checkout
+**`/SNS/VENUS/shared/software/git/mbirtorch_hsnt`** (clone of
+cabouman/mbirtorch with the remote `harel` = harel55/mbirtorch, **branch
+`hsnt`** checked out; `pixi install -e cuda` → torch 2.14 + CUDA 13, editable
+mbirtorch, so the checked-out branch is what runs). `<stem>_denoised.h5` is
+read back into frames; the dehydrated file (maps + spectra), the JSON report,
+the two PNG plots and the log are kept in memory and written into the export
+folder next to the TIFFs. The scratch folder is removed after the run.
+
+| Environment variable | Meaning |
+|---|---|
+| `DEHY_HSNT_PYTHON` | another interpreter with mbirtorch (default `mbirtorch_hsnt/.pixi/envs/cuda/bin/python`) |
+| `DEHY_HSNT_SCRATCH` | folder for the exchange files (default: the system temporary folder, `$TMPDIR` or `/tmp`) |
+
+The exchange file is as large as the stack in memory (512 × 512 × 5000
+images ≈ 5 GB), and the denoised file the CLI writes is as large again.
+
+Two safety nets around the subprocess: when the mode is `auto` and the full
+solve runs out of GPU memory (the CLI's memory plan cannot know what other
+programs hold on the GPU), the run is repeated in **stream mode**
+automatically (noted in the log, the result panel and the provenance); and
+the Python process is given a parent-death signal, so a killed GUI never
+leaves a solve holding the GPU's memory. A 512 × 512 × 2786 stack needs about
+28 GB for the compiled full solve on an A100 40 GB; with NeCTAR or another
+correction on the same GPU, pick another `cuda:N` or let the retry stream.
+
+To update the algorithm: `cd mbirtorch_hsnt && git fetch harel && git
+checkout hsnt && git pull` (or check out another branch, e.g. upstream
+`prerelease`, which carries the same package squashed in) — no rebuild of this
+program is needed. The **ℹ mbirtorch** button shows the commit that is
+checked out.
 
 ## Workflow (same as the notebook)
 
-1. **Open Folder…** — select the folder containing the TIFF images to correct
-   (when the folder has none, its subfolders are searched, like the notebook).
-   The classic GTK file chooser (typeable path) opens in `/SNS/VENUS`, or in
-   `/SNS/VENUS/IPTS-N/shared` when an experiment is picked in the toolbar
-   **IPTS** drop-down (`--ipts N` pre-selects it; a run-number lookup selects
-   the run's IPTS).
-   A folder, or TIFF / `.npy` files, can also be **dragged & dropped** onto
-   the window (one dataset per drop).
-   Files load in parallel; NaN/Inf pixels are zeroed (and counted in the
-   Data set panel). The **🕒 Recent** menu reopens one of the last 5 dataset
-   folders (persisted in `~/.config/venus_rust_tools/dehydration_hydration_recent`).
-   **🔍 Run number…** (or `-r/--run-number N` on the command line) locates the
-   data from its run number instead, as in rust_tiff_viewer: it finds
-   `/SNS/VENUS/IPTS-*/nexus/VENUS_N.nxs.h5` and reads the image folder, the
-   detector (`BL10:Exp:Det`, which also sets the load orientation) and the
-   detector offset (`BL10:Det:TH:DSPT1:TIDelay`, applied to the profile
-   plots) from it. A Timepix run asks for **Raw** or **Autoreduce** data —
-   the raw frames are `.fits` files this program cannot load, so the
-   autoreduce TIFFs (`<IPTS>/shared/autoreduce/<image folder>`) are the
-   usual choice; a CCD run loads its own `*_Run_N_*.tiff` image(s) directly.
-2. **Raw data** view — slide through the images next to the integrated (sum)
-   image. The **Data set** panel shows the folder, image count/size, and
-   memory footprint. In every image view, **Ctrl + mouse wheel** (⌘ + wheel
-   on macOS, or a trackpad pinch) zooms in/out around the pixel under the
-   cursor; the toolbar **−/+/Fit** buttons do the same from the toolbar.
-3. **Correction parameters** (left panel):
-   - **Dataset type** — `attenuation` or `transmission`, where
-     attenuation = −log(transmission). Default `attenuation`.
-   - **Number of materials** — how many different materials the data set
-     contains (1–10, default 2). The NMF subspace dimension is
-     2 × this number (safety factor 2). **Auto** estimates it from the data
-     (log-linear noise fit to the singular values of sampled pixel spectra —
-     the `_estimate_subspace_dimension` algorithm of mbirtorch).
-   - **Beta loss** — `frobenius` (coordinate-descent solver) or
-     `kullback-leibler` (multiplicative-update solver). Default `frobenius`.
-   - **Max iterations** — NMF solver cap (50–1000, default 300).
-4. **▶ Perform correction** — runs on a background thread with progress and a
-   cancel button; the image index is treated as the spectral axis, every
-   pixel spectrum is projected onto a low-dimensional non-negative subspace
-   (dehydration) and multiplied back (rehydration), discarding the noise
-   outside the subspace. **⚡ Preview** runs the same correction on
-   2×2-binned pixels (~4× faster) for parameter tuning; preview results are
-   labeled everywhere and cannot be exported.
-5. **Corrected vs raw** view — side-by-side comparison with shared contrast.
-   The right pane can switch to **Difference** (corrected − raw, symmetric
-   color range): structure there is what the correction removed.
-6. **Profiles** view — drag a region on the integrated corrected image and
-   compare the mean-intensity profiles of the corrected and uncorrected
-   stacks. The region can be **moved** (drag inside it) and **resized**
-   (drag one of its 8 handles); **clicking a pixel** adds that single
-   pixel's spectrum to the plot. When a `*_Spectra.txt` sits next to the
-   images, the x-axis can switch from image index to **TOF (µs)** or
-   **wavelength (Å)** (λ = h·t/(mₙ·L), source–detector distance editable,
-   default 25 m). A **detector offset** (µs, default 0, also settable with
-   `-t/--offset` as in rust_tiff_viewer) is added to the TOF values and
-   shifts the TOF and wavelength axes. Linear/log y-axis toggle, cursor
-   read-out in the plot corner, and **📄 Save CSV…** writes the plotted
-   profiles (with the offset applied to the TOF/λ columns when available).
-7. **💾 Export corrected images…** — pick an output folder; the corrected
-   stack is written as 32-bit float TIFFs (input file names kept) into a new
-   subfolder `<input-folder>_dehydration_hydration_corrected` (suffixed `_1`,
-   `_2`, … when it already exists), together with a
-   **`correction_config.json`** provenance file recording the input folder,
-   parameters, versions, and timestamp.
+1. **Open Folder…** / **Open Files…** / **🕒 Recent** / **🔍 Run number…**
+   (`-r/--run-number N`, NeXus lookup: detector, image folder and detector
+   offset; a Timepix run asks for raw or autoreduce data, autoreduce being
+   the loadable one). Folders and TIFF / `.npy` files can be dragged onto the
+   window. Files load in parallel; NaN/Inf pixels are zeroed.
+2. **Raw data** view — slide through the images next to the integrated image.
+3. **Correction parameters** (left panel) — the options of
+   `mbirtorch-hsnt denoise`:
+   - **Input type** — `transmission` (default: the normalized stacks this tool
+     loads), `attenuation` (= −log(transmission)) or `auto` (inferred from the
+     values; fails when non-negative values above 1.05 cannot be told apart).
+   - **Rank** — `auto` (estimated from the data by likelihood-ratio tests, at
+     full resolution and on pooled pixels; **Max rank** bounds the search,
+     default 6) or `fixed` N. About the number of distinct materials; the
+     components span the materials' spectra but need not be the materials.
+   - **Spectra** — `mle` (default), `unconstrained` (removes a low-dose bias,
+     worth it with many pixels), `support` (per-pixel component selection,
+     zeroes the background of the maps; **needs the dose**).
+   - **Dose known** — open-beam counts per pixel and bin. When given, the fit
+     reports a **reduced chi-square** against the Poisson noise (≈1 = at the
+     noise level).
+   - **Device** — `auto` (first CUDA GPU, else CPU), `cpu`, `cuda:N`.
+   - **Advanced (solver)** — mode `auto|full|stream`, max steps, rel. tol.,
+     max passes (stream mode), compile `auto|on|off`.
+4. **Mask** (left panel, optional) — restrict the solve to part of the
+   image: **✏ Draw rectangles** on the integrated image (right pane of the
+   Raw data view; *include* = keep only the pixels inside any include
+   rectangle, *exclude* = drop the pixels inside), keep the pixels whose
+   **integrated value** lies in a range (e.g. leave out the open beam
+   around the sample), and/or **📂 Load mask…** (TIFF or `.npy`, nonzero =
+   selected, read with the stack's detector orientation — e.g. from the
+   Hyperspectral Masker). The sources combine (file ∧ range ∧ rectangles);
+   the excluded pixels are tinted dark red on the panes, the count of
+   selected pixels is shown, **💾 Save mask…** writes the mask as an 8-bit
+   TIFF. Only the selected pixels are written to the exchange file (as a
+   pixels × bins table) and solved; the other pixels keep their raw values
+   in the corrected stack. Note: on a masked run mbirtorch cannot pool
+   neighbouring pixels in its rank estimate, so give the rank when the
+   estimate looks low. The mask is saved with the settings (⚙ Config).
+5. **▶ Perform correction** — runs the CLI on a background thread; the
+   progress bar follows the CLI's log (loading → rank estimate → solve →
+   outputs → read-back), **✖ Cancel** kills the Python process. **⚡ Preview**
+   runs on 2×2-binned pixels. **📜 Log** (toolbar, or next to the progress
+   bar) shows everything the CLI printed; it opens by itself when a run
+   fails.
+6. **Result** section — rank (and how it was obtained), solve mode / steps /
+   time / loss, reduced chi-square with the CLI's verdict (or the relative
+   residual when no dose was given), the CLI's warnings. **📈 Diagnostics**
+   shows the component spectra and maps plots, the data checks and the
+   memory plan.
+7. **Corrected vs raw** and **Profiles** views — unchanged from production
+   (shared contrast, difference pane, region + single-pixel profiles,
+   TOF / wavelength axes from `*_Spectra.txt`, detector offset, CSV export).
+   The profile series have fixed colors — uncorrected orange ✕, corrected
+   blue ● — and the marker glyph is in the legend text.
+8. **💾 Export corrected images…** — 32-bit float TIFFs (input names kept) in
+   `<input-folder>_dehydration_hydration_corrected[_N]`, plus
+   `correction_config.json` (parameters, CLI arguments, mbirtorch commit, the
+   fit summary) and the run's by-products: `hsnt_report.json`,
+   `hsnt_dehydrated.h5` (`subspace_data` maps, `subspace_basis` spectra,
+   `mean_pixel_spectrum`), `hsnt_spectra.png`, `hsnt_maps.png`,
+   `hsnt_log.txt`, the component maps as images `hsnt_map_<i>.tif`
+   (float32, 0 outside the mask) and, for a masked run, `mask.tif`.
+
+**⚙ Config** saves / loads the settings as an HDF5 file (format version 2:
+`/correction` holds `input_type`, `rank`, `max_rank`, `spectra`, `dose`,
+`device`, `mode`, `max_steps`, `rel_tol`, `max_passes`, `compile`). A
+version-1 file of the production tool still loads: its `dataset_type`
+becomes the input type and its `num_materials` the (fixed) rank.
 
 ## Headless batch mode
 
 ```bash
 dehydration_hydration /SNS/VENUS/IPTS-XXXX/.../Run_YYYY \
     --run --output /path/to/output \
-    --materials 2 --dataset-type attenuation --beta-loss frobenius --max-iter 300
+    --input-type transmission --rank auto --spectra mle [--dose 50] [--device cuda:1]
 ```
 
-Runs the same load → correct → export pipeline without a window (progress on
-stderr, the created folder printed on stdout) — for scripting many runs or
-pipeline integration. `--bin N` runs spatially binned. `--run-number N` can
-replace the INPUT path: the autoreduce TIFFs of a Timepix run (or the raw
-image(s) of any other run) are located from the run's NeXus file.
-
-The **ℹ mbirtorch** button (top-right) shows the algorithm provenance: the
-mbirtorch version the implementation is a port of (0.1.1, tracked as a
-constant in `src/app.rs` — bump it after diffing the denoising functions of
-`mbirtorch/hsnt.py` against the newer release) and the paper reference.
-The port was originally written against mbirjax 0.7.2; the `hsnt` module of
-MBIRTorch (mbirjax's successor) carries the same denoising code, only with an
-added `random_state` argument, so the earlier cross-validation still holds.
+Same load → correct → export pipeline without a window (the CLI's log is
+relayed on stderr, indented; the created folder is printed on stdout).
+`--bin N` runs spatially binned, `--run-number N` can replace the INPUT path,
+`--detector` forces the orientation. The mask: `--mask FILE`,
+`--mask-include x0,y0,x1,y1` / `--mask-exclude x0,y0,x1,y1` (repeatable,
+half-open pixel bounds in the oriented frame) and `--mask-range LO:HI` on
+the integrated image. For scripts written against the
+production tool, `--materials N` means `--rank N`, `--dataset-type` means
+`--input-type`, `--max-iter` means `--max-steps`, and `--beta-loss` /
+`--safety-factor` are accepted and ignored with a warning — so the Workflow
+Runner can be pointed at this binary with `WORKFLOW_DEHY_BIN`.
 
 ## Build & run
 
@@ -114,27 +168,33 @@ cargo build --release
 ```
 
 ```bash
-cargo test    # algorithm + IO unit tests, no display needed
+cargo test                 # IO / parsing unit tests, no Python needed
+cargo test -- --ignored    # + one real run through the mbirtorch environment
 ```
+
+The portal entry is **"Dehydration / Hydration Correction (beta, mbirtorch
+hsnt)"** in the Beta category of the unified launcher.
 
 ## Implementation notes
 
-- The NMF (NNDSVD initialization, coordinate-descent solver for the
-  Frobenius loss, multiplicative updates for Kullback-Leibler) is a native
-  Rust port of the scikit-learn `non_negative_factorization` path used by
-  `mbirtorch.hsnt`, parallelized with rayon — no Python, BLAS, or CUDA
-  dependency.
-- Large stacks are processed in batches of 2²⁷ elements exactly like the
-  Python code (per-batch basis estimation, basis merging, then a fixed-basis
-  projection of every batch).
-- Deviations from the Python original, all inconsequential in practice: the
-  randomized SVD and the batch shuffling are seeded (runs are reproducible
-  where the Python ones are not), the automatic material-count estimation is
-  not ported (the GUI always provides the number of materials), and the
-  final reconstruction is computed in f64 before the f32 cast.
-- TIFF frames are transposed on load for display (VENUS detector
-  orientation, same convention as rust_roi_selector / rust_tiff_viewer) and
-  transposed back on export, so exported files align with the input files on
-  disk.
+- `src/hsnt_cli.rs`: parameters ↔ CLI arguments, exchange HDF5 writer /
+  reader (streamed by blocks of rows; a masked stack goes as a (pixels ×
+  bins) table and comes back into the raw frames), the subprocess with live
+  log relay, stage detection from the log lines, cancel (kill), the report
+  parser, the component maps read from the dehydrated file.
+- `src/mask.rs`: the mask definition (rectangles, integrated-value range,
+  mask file) and its evaluation, binning for previews, TIFF read/write with
+  the detector orientation.
+- `src/correction.rs`: the GUI-independent run (binning for previews,
+  hand-off, read-back); `start_correction` streams `Progress`, `Log` and
+  `Done` messages to the app.
+- `src/export.rs`: provenance JSON (serde_json) + the artifacts;
+  `src/config.rs`: format version 2 with version-1 fallback.
+- The native NMF modules of production (`hsnt.rs`, `nmf.rs`, `linalg.rs`,
+  `examples/cross_check.rs`) are gone from this branch.
+- TIFF frames are oriented on load per detector (shared
+  `rust_detector_orientation` crate) and written back in the on-disk
+  orientation on export; the orientation is irrelevant to the algorithm
+  (per-pixel spectra), and the exchange file carries the oriented frames.
 - Light/dark theme preference is shared with the other VENUS rust tools
   (`~/.config/venus_rust_tools/theme`).

@@ -1,23 +1,25 @@
-//! Dehydration/Hydration Correction — native port of the VENUS
-//! dehydration_hydration notebook: load a stack of TIFF images, denoise it
-//! with the NMF dehydrate/rehydrate algorithm (mbirtorch.hsnt), inspect the
-//! result, and export the corrected stack. `--run` does the same without a
-//! GUI, for scripting and pipelines. The data can be given as files/folders
-//! or located from its run number (`--run-number`, NeXus lookup as in
-//! rust_tiff_viewer).
+//! Dehydration/Hydration Correction — beta on mbirtorch's `hsnt` package:
+//! load a stack of TIFF images, denoise it with the maximum-likelihood
+//! dehydrate/rehydrate factorization of `mbirtorch.hsnt` (Harel Dor's `hsnt`
+//! branch, run as a Python subprocess in its own pixi environment), inspect
+//! the result, and export the corrected stack. `--run` does the same without
+//! a GUI, for scripting and pipelines. The data can be given as
+//! files/folders or located from its run number (`--run-number`, NeXus
+//! lookup as in rust_tiff_viewer).
 
 use dehydration_hydration::app::DehydrationApp;
-use dehydration_hydration::correction::{run_correction, CorrectionParams, MATERIALS_FACTOR};
+use dehydration_hydration::correction::{run_correction, CorrectionParams};
 use dehydration_hydration::export::{export_corrected, Provenance};
-use dehydration_hydration::hsnt::DatasetType;
+use dehydration_hydration::hsnt_cli::{self, Compile, Device, InputType, Rank, SolveMode, Spectra};
+use dehydration_hydration::export::MaskInfo;
 use dehydration_hydration::loader;
-use dehydration_hydration::nmf::BetaLoss;
+use dehydration_hydration::mask::{MaskRect, MaskSpec, RectMode};
 use dehydration_hydration::run_lookup;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 const USAGE: &str = "\
-dehydration_hydration — NMF dehydration/hydration denoising of a TIFF stack
+dehydration_hydration (beta, mbirtorch hsnt) — dehydration/hydration denoising of a TIFF stack
 
 USAGE:
   dehydration_hydration [OPTIONS] [INPUT ...]
@@ -48,13 +50,49 @@ OPTIONS:
                            (requires INPUT or --run-number, and --output)
   -o, --output <DIR>       Folder receiving the corrected subfolder
                            '<input>_dehydration_hydration_corrected'
-  --materials <N>          Number of materials (default 2); the correction
-                           receives 4×N to keep extra degrees of freedom
-  --safety-factor <F>      Multiplier on the material count (after the ×4)
-                           giving the NMF subspace dimension (default 16)
-  --dataset-type <TYPE>    attenuation | transmission (default attenuation)
-  --beta-loss <LOSS>       frobenius | kullback-leibler (default frobenius)
-  --max-iter <N>           NMF iteration cap (default 300)
+
+  Correction (the options of `mbirtorch-hsnt denoise`):
+  --input-type <TYPE>      What the values are: transmission (default — the
+                           normalized stacks this tool loads), attenuation
+                           (= −log(transmission)), or auto (inferred from the
+                           values; fails when they cannot be told apart).
+                           --dataset-type is accepted as a synonym
+  --rank <N|auto>          Number of components, about the number of distinct
+                           materials (default auto: estimated from the data by
+                           likelihood-ratio tests). --materials N is a synonym
+  --max-rank <N>           Largest rank the estimate considers (default 6)
+  --spectra <HOW>          mle (default) | unconstrained | support — how the
+                           component spectra are estimated; support needs
+                           --dose
+  --dose <D>               Open-beam counts per pixel and bin, when known:
+                           gives the fit a chi-square against the Poisson
+                           noise (default: unknown)
+  --device <DEV>           auto (default: CUDA when available) | cpu | cuda |
+                           cuda:N
+  --mode <MODE>            auto (default) | full | stream — whole solve on the
+                           device or streamed by chunks of pixels
+  --max-steps <N>          Solver step cap of a full solve (default 1000;
+                           --max-iter is a synonym)
+  --rel-tol <F>            Relative loss change per step that stops the solve
+                           (default 1e-8)
+  --max-passes <N>         Stream mode: polish passes over the data (default 5)
+  --compile <auto|on|off>  torch.compile of the solver kernels (default auto)
+  --beta-loss, --safety-factor
+                           Options of the production (NMF) tool: accepted and
+                           ignored, with a warning, so existing scripts run
+
+  Mask (only the selected pixels are sent to mbirtorch; the others keep
+  their raw values in the corrected stack; all pixels when no mask option):
+  --mask <FILE>            Mask image (TIFF or .npy, nonzero = selected), read
+                           with the stack's detector orientation
+  --mask-include <x0,y0,x1,y1>
+                           Keep only the pixels inside this rectangle
+                           (half-open pixel bounds; repeatable: inside any)
+  --mask-exclude <x0,y0,x1,y1>
+                           Drop the pixels inside this rectangle (repeatable)
+  --mask-range <LO:HI>     Keep the pixels whose integrated (summed) value
+                           lies in [LO, HI]
+
   --bin <B>                Spatial binning factor (default 1 = full
                            resolution; >1 exports a binned preview)
   -t, --offset <MICROSEC>  Detector offset: constant added to the TOF values
@@ -70,9 +108,17 @@ OPTIONS:
                            on-disk orientation of the input
   -h, --help               Show this help
 
-The correction reproduces the dehydration_hydration notebook:
-mbirtorch.hsnt.hyper_denoise — M. S. N. Chowdhury et al., \"Fast Hyperspectral
-Neutron Tomography\", IEEE Trans. Comput. Imaging 11, 663-677 (2025).
+ENVIRONMENT:
+  DEHY_HSNT_PYTHON         Python interpreter with mbirtorch (default: the cuda
+                           pixi environment of git/mbirtorch_hsnt)
+  DEHY_HSNT_SCRATCH        Folder for the exchange HDF5 files (default: the
+                           system temporary folder)
+
+The correction is `mbirtorch.hsnt denoise`: the maximum-likelihood (Poisson)
+factorization X = W·H of the attenuation (dehydration), multiplied back into
+denoised data (rehydration), after M. S. N. Chowdhury et al., \"Fast
+Hyperspectral Neutron Tomography\", IEEE Trans. Comput. Imaging 11, 663-677
+(2025), as re-implemented by Harel Dor (mbirtorch branch hsnt).
 ";
 
 struct Cli {
@@ -87,6 +133,10 @@ struct Cli {
     run_number: Option<u32>,
     /// `--ipts`: pre-select the experiment the open dialogs start in.
     ipts: Option<u32>,
+    /// `--mask*`: the pixel mask definition (file loaded after the stack).
+    mask_file: Option<PathBuf>,
+    mask_rects: Vec<MaskRect>,
+    mask_range: Option<(f32, f32)>,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -100,6 +150,9 @@ fn parse_args() -> Result<Cli, String> {
         detector: None,
         run_number: None,
         ipts: None,
+        mask_file: None,
+        mask_rects: Vec::new(),
+        mask_range: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -126,42 +179,95 @@ fn parse_args() -> Result<Cli, String> {
                 let digits = digits.strip_prefix("IPTS-").unwrap_or(&digits);
                 cli.ipts = match digits.parse::<u32>() {
                     Ok(n) if n > 0 => Some(n),
-                    _ => {
-                        return Err(format!(
-                            "invalid --ipts '{v}': expected a number or IPTS-<number>"
-                        ));
-                    }
+                    _ => return Err(format!("invalid --ipts '{v}': expected a number or IPTS-<number>")),
                 };
             }
             "-o" | "--output" => cli.output = Some(PathBuf::from(value("--output")?)),
-            "--materials" => {
-                cli.params.num_materials = value("--materials")?
-                    .parse()
-                    .map_err(|_| "--materials must be a positive integer".to_owned())?;
+            "--input-type" | "--input_type" | "--dataset-type" | "--dataset_type" => {
+                let v = value("--input-type")?;
+                cli.params.input_type = InputType::parse(&v)
+                    .ok_or_else(|| format!("unknown input type '{v}': expected transmission, attenuation or auto"))?;
             }
-            "--safety-factor" | "--safety_factor" => {
-                cli.params.safety_factor = value("--safety-factor")?
-                    .parse()
-                    .map_err(|_| "--safety-factor must be a number".to_owned())?;
+            "--rank" | "--materials" => {
+                let v = value("--rank")?;
+                cli.params.rank = Rank::parse(&v)
+                    .ok_or_else(|| format!("invalid --rank '{v}': expected a positive integer or auto"))?;
             }
-            "--dataset-type" | "--dataset_type" => {
-                cli.params.dataset_type = match value("--dataset-type")?.as_str() {
-                    "attenuation" => DatasetType::Attenuation,
-                    "transmission" => DatasetType::Transmission,
-                    other => return Err(format!("unknown dataset type '{other}'")),
-                };
+            "--max-rank" | "--max_rank" => {
+                cli.params.max_rank = value("--max-rank")?
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| "--max-rank must be a positive integer".to_owned())?;
             }
-            "--beta-loss" | "--beta_loss" => {
-                cli.params.beta_loss = match value("--beta-loss")?.as_str() {
-                    "frobenius" => BetaLoss::Frobenius,
-                    "kullback-leibler" => BetaLoss::KullbackLeibler,
-                    other => return Err(format!("unknown beta loss '{other}'")),
-                };
+            "--spectra" => {
+                let v = value("--spectra")?;
+                cli.params.spectra = Spectra::parse(&v)
+                    .ok_or_else(|| format!("unknown --spectra '{v}': expected mle, unconstrained or support"))?;
             }
-            "--max-iter" | "--max_iter" => {
-                cli.params.max_iter = value("--max-iter")?
-                    .parse()
-                    .map_err(|_| "--max-iter must be a positive integer".to_owned())?;
+            "--dose" => {
+                let v = value("--dose")?;
+                let d: f64 = v.parse().map_err(|e| format!("invalid --dose '{v}': {e}"))?;
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(format!("--dose must be a positive number (got {v})"));
+                }
+                cli.params.dose = Some(d);
+            }
+            "--device" => {
+                let v = value("--device")?;
+                cli.params.device = Device::parse(&v)
+                    .ok_or_else(|| format!("invalid --device '{v}': expected auto, cpu, cuda or cuda:N"))?;
+            }
+            "--mode" => {
+                let v = value("--mode")?;
+                cli.params.mode = SolveMode::parse(&v)
+                    .ok_or_else(|| format!("invalid --mode '{v}': expected auto, full or stream"))?;
+            }
+            "--max-steps" | "--max_steps" | "--max-iter" | "--max_iter" => {
+                cli.params.max_steps = value("--max-steps")?
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| "--max-steps must be a positive integer".to_owned())?;
+            }
+            "--rel-tol" | "--rel_tol" => {
+                let v = value("--rel-tol")?;
+                let t: f64 = v.parse().map_err(|e| format!("invalid --rel-tol '{v}': {e}"))?;
+                if !(t.is_finite() && t >= 0.0) {
+                    return Err(format!("--rel-tol must be a non-negative number (got {v})"));
+                }
+                cli.params.rel_tol = t;
+            }
+            "--max-passes" | "--max_passes" => {
+                cli.params.max_passes = value("--max-passes")?
+                    .parse::<usize>()
+                    .map_err(|_| "--max-passes must be a non-negative integer".to_owned())?;
+            }
+            "--compile" => {
+                let v = value("--compile")?;
+                cli.params.compile = Compile::parse(&v)
+                    .ok_or_else(|| format!("invalid --compile '{v}': expected auto, on or off"))?;
+            }
+            "--mask" => cli.mask_file = Some(PathBuf::from(value("--mask")?)),
+            "--mask-include" | "--mask_include" | "--mask-exclude" | "--mask_exclude" => {
+                let v = value(&a)?;
+                let mode = if a.contains("include") { RectMode::Include } else { RectMode::Exclude };
+                cli.mask_rects.push(MaskRect::parse(&v, mode).ok_or_else(|| {
+                    format!("invalid {a} '{v}': expected x0,y0,x1,y1 with x1 > x0 and y1 > y0")
+                })?);
+            }
+            "--mask-range" | "--mask_range" => {
+                let v = value("--mask-range")?;
+                let (lo, hi) = v
+                    .split_once(':')
+                    .and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?)))
+                    .filter(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo <= hi)
+                    .ok_or_else(|| format!("invalid --mask-range '{v}': expected LO:HI with LO <= HI"))?;
+                cli.mask_range = Some((lo, hi));
+            }
+            "--beta-loss" | "--beta_loss" | "--safety-factor" | "--safety_factor" => {
+                let v = value(&a)?;
+                eprintln!("Warning: {a} {v} is an option of the production NMF tool; the beta ignores it.");
             }
             "--bin" => {
                 cli.bin = value("--bin")?
@@ -190,12 +296,7 @@ fn parse_args() -> Result<Cli, String> {
             _ => cli.inputs.push(PathBuf::from(a)),
         }
     }
-    if cli.params.num_materials == 0 {
-        return Err("--materials must be at least 1".to_owned());
-    }
-    if !cli.params.safety_factor.is_finite() || cli.params.safety_factor < 1.0 {
-        return Err("--safety-factor must be at least 1".to_owned());
-    }
+    cli.params.validate().map_err(|e| e.to_string())?;
     if cli.run {
         if cli.inputs.is_empty() && cli.run_number.is_none() {
             return Err("--run requires an INPUT folder or files, or --run-number".to_owned());
@@ -272,6 +373,37 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         stack.orientation
     );
 
+    // The mask, from the command-line definition and the integrated image.
+    let mut spec = MaskSpec {
+        rects: cli.mask_rects.clone(),
+        range: cli.mask_range,
+        file: None,
+    };
+    if let Some(path) = &cli.mask_file {
+        let pixels = dehydration_hydration::mask::load_file(path, stack.detector)?;
+        spec.file = Some(dehydration_hydration::mask::MaskFile {
+            path: path.clone(),
+            pixels: std::sync::Arc::new(pixels),
+        });
+    }
+    let mask = if spec.is_empty() {
+        None
+    } else {
+        let mut integrated = ndarray::Array2::<f32>::zeros((stack.height, stack.width));
+        for f in &stack.frames {
+            integrated += f;
+        }
+        let m = spec.build(&integrated)?.expect("non-empty spec");
+        let n = dehydration_hydration::mask::count(&m);
+        eprintln!(
+            "Mask: {} — {n} of {} pixel(s) selected ({:.1}%).",
+            spec.describe(),
+            m.len(),
+            100.0 * n as f64 / m.len().max(1) as f64
+        );
+        Some(m)
+    };
+
     let cancel = AtomicBool::new(false);
     let mut last_stage = String::new();
     let mut progress = |stage: &str, fraction: f32| {
@@ -280,18 +412,25 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
             last_stage = stage.to_owned();
         }
     };
+    let mut log = |line: &str| eprintln!("    {line}");
     eprintln!(
-        "Number of materials: {} (×{} → {} passed to the correction, safety factor {}).",
-        cli.params.num_materials,
-        MATERIALS_FACTOR,
-        cli.params.num_materials * MATERIALS_FACTOR,
-        cli.params.safety_factor
+        "mbirtorch hsnt ({}): {}",
+        hsnt_cli::mbirtorch_commit().unwrap_or_else(|| "commit unknown".to_owned()),
+        cli.params.summary()
     );
-    let out = run_correction(&stack, cli.params, cli.bin, &cancel, &mut progress)?;
+    let out = run_correction(&stack, cli.params, cli.bin, mask.as_ref(), &cancel, &mut progress, &mut log)?;
     eprintln!(
-        "Correction done in {:.1} s (subspace dimension {}).",
-        out.elapsed_seconds, out.subspace_dimension
+        "Correction done in {:.1} s — {}",
+        out.elapsed_seconds,
+        if out.report.summary_line.is_empty() {
+            "no summary from mbirtorch".to_owned()
+        } else {
+            out.report.summary_line.clone()
+        }
     );
+    for w in &out.report.warnings {
+        eprintln!("  warning: {w}");
+    }
 
     let input_dir = files
         .first()
@@ -309,9 +448,15 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         image_width: w,
         image_height: h,
         params: cli.params,
-        subspace_dimension: out.subspace_dimension,
         bin: out.bin,
         elapsed_seconds: out.elapsed_seconds,
+        report: out.report.clone(),
+        mbirtorch_commit: hsnt_cli::mbirtorch_commit(),
+        mask: out.mask.as_ref().map(|m| MaskInfo {
+            selected: out.n_pixels,
+            total: m.len(),
+            description: spec.describe(),
+        }),
     };
     let folder = export_corrected(
         cli.output.as_deref().expect("checked in parse_args"),
@@ -320,6 +465,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         &stack.sources,
         stack.orientation,
         &provenance,
+        &out.artifacts,
         &mut |_, _| {},
     )?;
     eprintln!("Exported {} corrected image(s).", out.frames.len());
@@ -346,6 +492,7 @@ fn main() -> eframe::Result<()> {
     let detector = cli.detector;
     let run_number = cli.run_number;
     let ipts = cli.ipts;
+    let params = cli.params;
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
@@ -355,15 +502,16 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    const TITLE: &str = "VENUS Dehydration / Hydration Correction (beta — mbirtorch hsnt)";
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_title("VENUS Dehydration / Hydration Correction"),
+            .with_title(TITLE),
         ..Default::default()
     };
 
     eframe::run_native(
-        "VENUS Dehydration / Hydration Correction",
+        TITLE,
         native_options,
         Box::new(move |cc| {
             // Saved light/dark preference, shared by all the VENUS rust
@@ -376,6 +524,7 @@ fn main() -> eframe::Result<()> {
             app.set_detector_offset(offset_us);
             app.set_detector_override(detector);
             app.set_ipts(ipts);
+            app.set_params(params);
             if !files.is_empty() {
                 app.start_load(files, &cc.egui_ctx);
             }

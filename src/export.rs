@@ -1,13 +1,16 @@
 //! Exporting the corrected stack as 32-bit float TIFF files (one per input
 //! image, keeping the input file names) together with a provenance file
-//! (`correction_config.json`) recording exactly how they were produced.
-//! Also: CSV export of the profile plots.
+//! (`correction_config.json`) recording exactly how they were produced, and
+//! the by-products of the mbirtorch run (its JSON report, the dehydrated
+//! maps + spectra file, the PNG plots and the log). Also: CSV export of the
+//! profile plots.
 //!
 //! [`export_corrected`] is the synchronous, GUI-free core (also used by the
 //! headless `--run` mode); [`start_export`] wraps it on a background thread
 //! for the egui app.
 
 use crate::correction::CorrectionParams;
+use crate::hsnt_cli::{Artifact, HsntReport};
 use anyhow::{Context, Result};
 use detector_orientation::Orientation;
 use ndarray::Array2;
@@ -21,10 +24,24 @@ pub struct Provenance {
     pub image_width: usize,
     pub image_height: usize,
     pub params: CorrectionParams,
-    pub subspace_dimension: usize,
     /// Spatial binning factor of the run (1 = full resolution).
     pub bin: usize,
     pub elapsed_seconds: f64,
+    /// What the mbirtorch run reported.
+    pub report: HsntReport,
+    /// Commit + branch of the mbirtorch checkout that ran.
+    pub mbirtorch_commit: Option<String>,
+    /// The pixel mask, when one restricted the solve.
+    pub mask: Option<MaskInfo>,
+}
+
+/// What the provenance records about the mask.
+pub struct MaskInfo {
+    /// Pixels handed to the solver (of the binned stack for a preview).
+    pub selected: usize,
+    pub total: usize,
+    /// How the mask was defined (see `MaskSpec::describe`).
+    pub description: String,
 }
 
 /// `<output>/<input-folder-name>_dehydration_hydration_corrected`, suffixed
@@ -70,9 +87,10 @@ pub fn output_name(input: &Path) -> String {
     format!("{stem}.tif")
 }
 
-/// Write the corrected stack + provenance file into a fresh export folder
-/// under `output_dir`, reporting `(files_done, files_total)`. Returns the
-/// created folder.
+/// Write the corrected stack + provenance file + the run's by-products into
+/// a fresh export folder under `output_dir`, reporting `(files_done,
+/// files_total)`. Returns the created folder.
+#[allow(clippy::too_many_arguments)]
 pub fn export_corrected(
     output_dir: &Path,
     input_dir_name: &str,
@@ -80,6 +98,7 @@ pub fn export_corrected(
     sources: &[PathBuf],
     orientation: Orientation,
     provenance: &Provenance,
+    artifacts: &[Artifact],
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<PathBuf> {
     let folder = make_export_folder(output_dir, input_dir_name)?;
@@ -95,60 +114,68 @@ pub fn export_corrected(
     let json = provenance_json(provenance);
     std::fs::write(folder.join("correction_config.json"), json)
         .with_context(|| format!("write provenance in {}", folder.display()))?;
+    for a in artifacts {
+        std::fs::write(folder.join(&a.name), &a.bytes)
+            .with_context(|| format!("write {} in {}", a.name, folder.display()))?;
+    }
     Ok(folder)
 }
 
-/// The provenance file contents. Hand-written JSON: the structure is small
-/// and flat, not worth a serde dependency.
+/// The provenance file contents.
 pub fn provenance_json(p: &Provenance) -> String {
-    format!(
-        r#"{{
-  "tool": "rust_dehydration_hydration",
-  "tool_version": "{version}",
-  "algorithm": "mbirtorch.hsnt.hyper_denoise (native port)",
-  "mbirtorch_reference_version": "{mbirtorch}",
-  "created_utc": "{time}",
-  "input_folder": "{input}",
-  "num_images": {n},
-  "image_width": {w},
-  "image_height": {h},
-  "parameters": {{
-    "dataset_type": "{dtype}",
-    "num_materials": {materials},
-    "materials_factor": {factor},
-    "num_materials_passed": {materials_passed},
-    "beta_loss": "{beta}",
-    "max_iter": {max_iter},
-    "safety_factor": {safety},
-    "subspace_dimension": {subdim}
-  }},
-  "spatial_binning": {bin},
-  "elapsed_seconds": {elapsed:.1}
-}}
-"#,
-        version = env!("CARGO_PKG_VERSION"),
-        mbirtorch = crate::hsnt::MBIRTORCH_VERSION,
-        time = iso8601_utc_now(),
-        input = json_escape(&p.input_folder.display().to_string()),
-        n = p.num_images,
-        w = p.image_width,
-        h = p.image_height,
-        dtype = p.params.dataset_type.label(),
-        materials = p.params.num_materials,
-        factor = crate::correction::MATERIALS_FACTOR,
-        materials_passed = p.params.num_materials * crate::correction::MATERIALS_FACTOR,
-        beta = p.params.beta_loss.label(),
-        max_iter = p.params.max_iter,
-        safety = p.params.safety_factor,
-        subdim = p.subspace_dimension,
-        bin = p.bin,
-        elapsed = p.elapsed_seconds,
-    )
+    let doc = serde_json::json!({
+        "tool": "rust_dehydration_hydration",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "tool_variant": "beta — mbirtorch hsnt",
+        "algorithm": "mbirtorch.hsnt denoise: maximum-likelihood (Poisson) factorization X = W·H of the attenuation, dehydrate + rehydrate",
+        "mbirtorch_checkout": crate::hsnt_cli::MBIRTORCH_CHECKOUT,
+        "mbirtorch_branch": crate::hsnt_cli::MBIRTORCH_BRANCH,
+        "mbirtorch_commit": p.mbirtorch_commit,
+        "created_utc": iso8601_utc_now(),
+        "input_folder": p.input_folder.display().to_string(),
+        "num_images": p.num_images,
+        "image_width": p.image_width,
+        "image_height": p.image_height,
+        "parameters": {
+            "input_type": p.params.input_type.label(),
+            "rank": p.params.rank.label(),
+            "max_rank": p.params.max_rank,
+            "spectra": p.params.spectra.label(),
+            "dose": p.params.dose,
+            "device": p.params.device.label(),
+            "mode": p.params.mode.label(),
+            "max_steps": p.params.max_steps,
+            "rel_tol": p.params.rel_tol,
+            "max_passes": p.params.max_passes,
+            "compile": p.params.compile.label(),
+            "cli_args": p.params.cli_args(),
+        },
+        "result": p.report.to_json(),
+        "mask": p.mask.as_ref().map(|m| serde_json::json!({
+            "pixels_selected": m.selected,
+            "pixels_total": m.total,
+            "fraction": m.selected as f64 / m.total.max(1) as f64,
+            "definition": m.description,
+            "file": "mask.tif",
+            "outside_mask": "pixels outside the mask were not sent to mbirtorch and keep their raw values"
+        })),
+        "spatial_binning": p.bin,
+        "elapsed_seconds": (p.elapsed_seconds * 10.0).round() / 10.0,
+        "files": {
+            "hsnt_report.json": "the CLI's full report (checks, memory plan, rank search, fit)",
+            "hsnt_dehydrated.h5": "subspace_data (maps) + subspace_basis (spectra): the dehydrated form",
+            "hsnt_spectra.png": "component spectra plot",
+            "hsnt_maps.png": "component maps plot",
+            "hsnt_log.txt": "the CLI's log",
+            "hsnt_map_<i>.tif": "component map i as a float32 image (0 outside the mask)",
+            "mask.tif": "the pixel mask (255 = sent to the solver), only when one was set"
+        }
+    });
+    let mut text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string());
+    text.push('\n');
+    text
 }
 
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
 
 /// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ`, from the system clock only
 /// (no chrono dependency; civil-from-days per Howard Hinnant).
@@ -231,6 +258,7 @@ pub fn start_export(
     sources: Vec<PathBuf>,
     orientation: Orientation,
     provenance: Provenance,
+    artifacts: Vec<Artifact>,
     ctx: egui::Context,
 ) -> Receiver<ExportMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -248,6 +276,7 @@ pub fn start_export(
             &sources,
             orientation,
             &provenance,
+            &artifacts,
             &mut progress,
         );
         let _ = tx.send(ExportMsg::Done(result.map_err(|e| format!("{e:#}"))));
@@ -274,9 +303,16 @@ mod tests {
             image_width: 5,
             image_height: 3,
             params: CorrectionParams::default(),
-            subspace_dimension: 4,
             bin: 1,
             elapsed_seconds: 1.5,
+            report: HsntReport {
+                rank: Some(2),
+                rank_note: "rank 2 given".to_owned(),
+                reduced_chi2: Some(1.05),
+                ..HsntReport::default()
+            },
+            mbirtorch_commit: Some("edb0bcb (hsnt)".to_owned()),
+            mask: Some(MaskInfo { selected: 10, total: 15, description: "1 include rectangle(s)".to_owned() }),
         }
     }
 
@@ -337,16 +373,23 @@ mod tests {
             &sources,
             Orientation::Transpose,
             &provenance(),
+            &[Artifact { name: "hsnt_report.json".to_owned(), bytes: b"{}".to_vec() }],
             &mut |d, t| ticks.push((d, t)),
         )
         .unwrap();
         assert!(folder.join("a_0000.tif").is_file());
         assert!(folder.join("a_0001.tif").is_file());
+        assert!(folder.join("hsnt_report.json").is_file());
         assert_eq!(ticks, vec![(1, 2), (2, 2)]);
         let json = std::fs::read_to_string(folder.join("correction_config.json")).unwrap();
-        assert!(json.contains("\"num_materials\": 2"));
-        assert!(json.contains("\"mbirtorch_reference_version\": \"0.1.1\""));
-        assert!(json.contains("/data/Run_1"));
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["parameters"]["rank"], "auto");
+        assert_eq!(doc["parameters"]["input_type"], "transmission");
+        assert_eq!(doc["result"]["rank"], 2);
+        assert_eq!(doc["result"]["reduced_chi2"], 1.05);
+        assert_eq!(doc["mbirtorch_commit"], "edb0bcb (hsnt)");
+        assert_eq!(doc["mask"]["pixels_selected"], 10);
+        assert_eq!(doc["input_folder"], "/data/Run_1");
     }
 
     #[test]

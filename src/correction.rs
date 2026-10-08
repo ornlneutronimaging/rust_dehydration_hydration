@@ -1,64 +1,19 @@
-//! Running the correction: build the (points × bands) hyperspectral matrix
-//! from the image stack, run [`crate::hsnt::hyper_denoise`], and reshape the
-//! result back into a stack of frames.
+//! Running the correction: hand the image stack to the `mbirtorch.hsnt`
+//! command line (see [`crate::hsnt_cli`]) and turn what it writes back into
+//! a stack of frames.
 //!
 //! [`run_correction`] is the synchronous, GUI-free core (also used by the
 //! headless `--run` mode); [`start_correction`] wraps it on a background
-//! thread streaming progress to the egui app over a channel.
+//! thread streaming progress and log lines to the egui app over a channel.
 
-use crate::hsnt::{hyper_denoise, DatasetType, HsntParams};
+pub use crate::hsnt_cli::HsntParams as CorrectionParams;
+use crate::hsnt_cli::{run_denoise, Artifact, HsntReport, ScratchDir};
 use crate::loader::ImageStack;
-use crate::nmf::BetaLoss;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ndarray::Array2;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-
-/// The user's "number of materials" is multiplied by this before it is
-/// handed to the correction, so the factorization keeps a comfortable
-/// number of degrees of freedom. Surfaced in the GUI, the CLI help and the
-/// provenance file — `num_materials` everywhere else stays the user's value.
-pub const MATERIALS_FACTOR: usize = 4;
-
-/// The user-facing parameters — the ones the notebook exposes. The rest of
-/// [`HsntParams`] keeps the notebook's defaults.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct CorrectionParams {
-    pub dataset_type: DatasetType,
-    pub num_materials: usize,
-    /// Multiplier on the material count (after [`MATERIALS_FACTOR`]) giving
-    /// the NMF subspace dimension: `safety_factor × MATERIALS_FACTOR × N`,
-    /// capped at the number of images.
-    pub safety_factor: f64,
-    pub beta_loss: BetaLoss,
-    pub max_iter: usize,
-}
-
-impl Default for CorrectionParams {
-    fn default() -> Self {
-        Self {
-            dataset_type: DatasetType::Attenuation,
-            num_materials: 2,
-            safety_factor: 16.0,
-            beta_loss: BetaLoss::Frobenius,
-            max_iter: 300,
-        }
-    }
-}
-
-impl CorrectionParams {
-    pub fn to_hsnt(self) -> HsntParams {
-        HsntParams {
-            dataset_type: self.dataset_type,
-            num_materials: self.num_materials * MATERIALS_FACTOR,
-            safety_factor: self.safety_factor,
-            beta_loss: self.beta_loss,
-            max_iter: self.max_iter,
-            ..HsntParams::default()
-        }
-    }
-}
 
 pub struct CorrectionOutput {
     /// Corrected frames, same order as the input stack (spatially binned by
@@ -73,8 +28,20 @@ pub struct CorrectionOutput {
     pub binned_raw: Option<Vec<Array2<f32>>>,
     /// Spatial binning factor (1 = full resolution, >1 = preview).
     pub bin: usize,
-    pub subspace_dimension: usize,
     pub elapsed_seconds: f64,
+    /// What the CLI reported about the fit.
+    pub report: HsntReport,
+    /// The CLI's by-products (report, dehydrated file, plots, log), for the
+    /// export folder.
+    pub artifacts: Vec<Artifact>,
+    /// Every line the CLI printed.
+    pub log: Vec<String>,
+    /// The mask the solver saw (binned for previews), when one was set.
+    pub mask: Option<Array2<bool>>,
+    /// Pixels handed to the solver.
+    pub n_pixels: usize,
+    /// The component maps as images (0 outside the mask).
+    pub maps: Vec<Array2<f32>>,
 }
 
 impl CorrectionOutput {
@@ -106,104 +73,138 @@ pub fn bin_frames(frames: &[Array2<f32>], bin: usize) -> Vec<Array2<f32>> {
         .collect()
 }
 
-/// Synchronous correction of a whole stack. `bin > 1` runs a spatially
-/// binned preview. Progress arrives as `(stage, fraction)`; setting `cancel`
-/// aborts at the solver's next iteration.
+/// Synchronous correction of a whole stack, or of the pixels `mask` selects
+/// (the stack's size; true = keep — the other pixels are not sent to the
+/// solver and keep their raw values). `bin > 1` runs a spatially binned
+/// preview. Progress arrives as `(stage, fraction)`, the CLI's output line
+/// by line in `log`; setting `cancel` kills the Python process.
 pub fn run_correction(
     stack: &ImageStack,
     params: CorrectionParams,
     bin: usize,
+    mask: Option<&Array2<bool>>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str, f32),
+    log: &mut dyn FnMut(&str),
 ) -> Result<CorrectionOutput> {
     let started = std::time::Instant::now();
 
     progress("Preparing data", 0.0);
     let bin = bin.max(1);
-    let (work_frames, binned_raw) = if bin > 1 {
-        let binned = bin_frames(&stack.frames, bin);
-        (binned.clone(), Some(binned))
-    } else {
-        (stack.frames.clone(), None)
-    };
-    let (h, w) = match work_frames.first() {
-        Some(f) => (f.nrows(), f.ncols()),
-        None => anyhow::bail!("empty stack"),
-    };
-    let x = frames_to_matrix(&work_frames, h, w);
-    progress("Preparing data", 1.0);
+    if stack.frames.is_empty() {
+        anyhow::bail!("empty stack");
+    }
+    if let Some(m) = mask
+        && m.dim() != (stack.height, stack.width)
+    {
+        anyhow::bail!(
+            "the mask is {}×{} px, the stack {}×{}",
+            m.ncols(),
+            m.nrows(),
+            stack.width,
+            stack.height
+        );
+    }
+    let binned_raw = (bin > 1).then(|| bin_frames(&stack.frames, bin));
+    let work_frames: &[Array2<f32>] = binned_raw.as_deref().unwrap_or(&stack.frames);
+    let (h, w) = work_frames[0].dim();
+    let work_mask = mask.map(|m| crate::mask::bin_mask(m, bin));
 
-    let denoised = hyper_denoise(x, &params.to_hsnt(), cancel, progress)?;
+    let outcome = run_denoise(work_frames, work_mask.as_ref(), &params, cancel, progress, log)?;
 
-    progress("Assembling corrected stack", 0.0);
-    let frames = matrix_to_frames(&denoised, h, w);
-    let integrated_mean = integrated_mean(&frames, h, w);
+    progress("Assembling corrected stack", 0.99);
+    let integrated_mean = integrated_mean(&outcome.frames, h, w);
+    let mut artifacts = outcome.artifacts;
+    artifacts.extend(image_artifacts(&outcome.maps, work_mask.as_ref(), stack.orientation, log));
     progress("Assembling corrected stack", 1.0);
 
     Ok(CorrectionOutput {
-        frames,
+        frames: outcome.frames,
         integrated_mean,
         binned_raw,
         bin,
-        subspace_dimension: params.to_hsnt().subspace_dimension(),
         elapsed_seconds: started.elapsed().as_secs_f64(),
+        report: outcome.report,
+        artifacts,
+        log: outcome.log,
+        mask: work_mask,
+        n_pixels: outcome.n_pixels,
+        maps: outcome.maps,
     })
+}
+
+/// The component maps (`hsnt_map_<i>.tif`, float32) and the mask
+/// (`mask.tif`, 8-bit, 255 = selected) as TIFF files in the on-disk
+/// orientation of the input, encoded through a scratch folder.
+fn image_artifacts(
+    maps: &[Array2<f32>],
+    mask: Option<&Array2<bool>>,
+    orientation: crate::loader::Orientation,
+    log: &mut dyn FnMut(&str),
+) -> Vec<Artifact> {
+    let mut out = Vec::new();
+    let encode = || -> Result<Vec<Artifact>> {
+        let scratch = ScratchDir::create()?;
+        let mut files = Vec::new();
+        for (i, map) in maps.iter().enumerate() {
+            let name = format!("hsnt_map_{}.tif", i + 1);
+            let path = scratch.path().join(&name);
+            crate::export::write_f32_tiff(&path, map, orientation)?;
+            files.push(Artifact { name, bytes: std::fs::read(&path).context("read back the map")? });
+        }
+        if let Some(m) = mask {
+            let path = scratch.path().join("mask.tif");
+            crate::mask::save_file(&path, m, orientation)?;
+            files.push(Artifact { name: "mask.tif".to_owned(), bytes: std::fs::read(&path).context("read back the mask")? });
+        }
+        Ok(files)
+    };
+    match encode() {
+        Ok(files) => out.extend(files),
+        Err(e) => log(&format!("[dehydration_hydration] cannot encode the map / mask images: {e:#}")),
+    }
+    out
 }
 
 pub enum CorrectionMsg {
     Progress { stage: String, fraction: f32 },
+    /// One line of the CLI's output.
+    Log(String),
     Done(Result<CorrectionOutput, String>),
 }
 
 /// Spawn the correction thread for the GUI. Poll the returned receiver each
-/// frame; store `cancel` and set it to stop the solver.
+/// frame; store `cancel` and set it to stop the run.
 pub fn start_correction(
     stack: Arc<ImageStack>,
     params: CorrectionParams,
     bin: usize,
+    mask: Option<Arc<Array2<bool>>>,
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
 ) -> Receiver<CorrectionMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let tx_progress = tx.clone();
+        let ctx_progress = ctx.clone();
         let mut progress = |stage: &str, fraction: f32| {
-            let _ = tx.send(CorrectionMsg::Progress {
+            let _ = tx_progress.send(CorrectionMsg::Progress {
                 stage: stage.to_owned(),
                 fraction,
             });
-            ctx.request_repaint();
+            ctx_progress.request_repaint();
         };
-        let result = run_correction(&stack, params, bin, &cancel, &mut progress);
+        let tx_log = tx.clone();
+        let ctx_log = ctx.clone();
+        let mut log = |line: &str| {
+            let _ = tx_log.send(CorrectionMsg::Log(line.to_owned()));
+            ctx_log.request_repaint();
+        };
+        let result = run_correction(&stack, params, bin, mask.as_deref(), &cancel, &mut progress, &mut log);
         let _ = tx.send(CorrectionMsg::Done(result.map_err(|e| format!("{e:#}"))));
         ctx.request_repaint();
     });
     rx
-}
-
-/// (points × bands) matrix: row = pixel (row-major over the frame), column =
-/// image index. The image index is the spectral axis — the same layout as
-/// the notebook's `swapaxes(raw, 0, 2)` + reshape, up to a pixel ordering
-/// that the round-trip undoes.
-pub fn frames_to_matrix(frames: &[Array2<f32>], h: usize, w: usize) -> Array2<f64> {
-    let n = frames.len();
-    let mut x = Array2::<f64>::zeros((h * w, n));
-    for (i, frame) in frames.iter().enumerate() {
-        let mut col = x.column_mut(i);
-        for (dst, &v) in col.iter_mut().zip(frame.iter()) {
-            *dst = f64::from(v);
-        }
-    }
-    x
-}
-
-fn matrix_to_frames(x: &Array2<f32>, h: usize, w: usize) -> Vec<Array2<f32>> {
-    let n = x.ncols();
-    (0..n)
-        .map(|i| {
-            let col = x.column(i);
-            Array2::from_shape_fn((h, w), |(y, xx)| col[y * w + xx])
-        })
-        .collect()
 }
 
 fn integrated_mean(frames: &[Array2<f32>], h: usize, w: usize) -> Array2<f32> {
@@ -220,35 +221,6 @@ fn integrated_mean(frames: &[Array2<f32>], h: usize, w: usize) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn make_stack(frames: Vec<Array2<f32>>) -> ImageStack {
-        let (h, w) = (frames[0].nrows(), frames[0].ncols());
-        let sources = frames.iter().map(|_| PathBuf::from("x.tif")).collect();
-        ImageStack {
-            frames,
-            width: w,
-            height: h,
-            sources,
-            detector: Default::default(),
-            orientation: crate::loader::Orientation::Transpose,
-            nonfinite_fixed: 0,
-        }
-    }
-
-    #[test]
-    fn matrix_roundtrip_preserves_pixels() {
-        let f0 = Array2::from_shape_fn((3, 4), |(y, x)| (y * 4 + x) as f32);
-        let f1 = f0.mapv(|v| v * 10.0);
-        let stack = make_stack(vec![f0.clone(), f1.clone()]);
-        let x = frames_to_matrix(&stack.frames, 3, 4);
-        assert_eq!(x.dim(), (12, 2));
-        assert_eq!(x[[5, 0]], 5.0);
-        assert_eq!(x[[5, 1]], 50.0);
-        let back = matrix_to_frames(&x.mapv(|v| v as f32), 3, 4);
-        assert_eq!(back[0], f0);
-        assert_eq!(back[1], f1);
-    }
 
     #[test]
     fn binning_averages_blocks_and_drops_ragged_edges() {
@@ -260,30 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_run_returns_binned_frames_and_reference() {
-        let frames: Vec<Array2<f32>> = (0..6)
-            .map(|i| {
-                Array2::from_shape_fn((8, 8), |(y, x)| {
-                    1.0 + (i as f32) * 0.1 + ((y + x) as f32) * 0.01
-                })
-            })
-            .collect();
-        let stack = make_stack(frames);
-        let cancel = AtomicBool::new(false);
-        let out = run_correction(
-            &stack,
-            CorrectionParams {
-                max_iter: 60,
-                ..Default::default()
-            },
-            2,
-            &cancel,
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert!(out.is_preview());
-        assert_eq!(out.frames[0].dim(), (4, 4));
-        assert_eq!(out.binned_raw.as_ref().unwrap()[0].dim(), (4, 4));
-        assert_eq!(out.frames.len(), 6);
+    fn integrated_mean_averages_frames() {
+        let a = Array2::from_elem((2, 2), 1.0f32);
+        let b = Array2::from_elem((2, 2), 3.0f32);
+        assert_eq!(integrated_mean(&[a, b], 2, 2), Array2::from_elem((2, 2), 2.0f32));
     }
 }

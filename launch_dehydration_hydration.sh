@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Launch the Dehydration/Hydration Correction GUI, rebuilding first if the
+# Launch the Dehydration/Hydration Correction GUI — BETA on mbirtorch hsnt
+# (see README.md), rebuilding first if the
 # sources changed.
 #
 # Usage: ./launch_dehydration_hydration.sh [dehydration_hydration arguments...]
