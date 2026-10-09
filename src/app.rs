@@ -879,6 +879,7 @@ impl DehydrationApp {
             subspace_dimension: result.subspace_dimension,
             bin: result.bin,
             elapsed_seconds: result.elapsed_seconds,
+            mask: None,
         };
         let rx = start_export(
             output_dir,

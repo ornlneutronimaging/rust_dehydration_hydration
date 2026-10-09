@@ -25,6 +25,9 @@ pub struct Provenance {
     /// Spatial binning factor of the run (1 = full resolution).
     pub bin: usize,
     pub elapsed_seconds: f64,
+    /// The `--mask` file, when the run corrected only part of the stack,
+    /// with the number of pixels it selected (full resolution).
+    pub mask: Option<(PathBuf, usize)>,
 }
 
 /// `<output>/<input-folder-name>_dehydration_hydration_corrected`, suffixed
@@ -123,6 +126,7 @@ pub fn provenance_json(p: &Provenance) -> String {
     "subspace_dimension": {subdim}
   }},
   "spatial_binning": {bin},
+  "mask": {mask},
   "elapsed_seconds": {elapsed:.1}
 }}
 "#,
@@ -142,6 +146,13 @@ pub fn provenance_json(p: &Provenance) -> String {
         safety = p.params.safety_factor,
         subdim = p.subspace_dimension,
         bin = p.bin,
+        mask = match &p.mask {
+            Some((file, n)) => format!(
+                r#"{{"file": "{}", "pixels_selected": {n}, "outside": "pixels outside the mask were not corrected and keep their input values"}}"#,
+                json_escape(&file.display().to_string())
+            ),
+            None => "null".to_owned(),
+        },
         elapsed = p.elapsed_seconds,
     )
 }
@@ -277,6 +288,7 @@ mod tests {
             subspace_dimension: 4,
             bin: 1,
             elapsed_seconds: 1.5,
+            mask: None,
         }
     }
 

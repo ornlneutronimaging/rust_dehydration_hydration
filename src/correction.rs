@@ -75,6 +75,9 @@ pub struct CorrectionOutput {
     pub bin: usize,
     pub subspace_dimension: usize,
     pub elapsed_seconds: f64,
+    /// Pixels that went into the NMF (all of them without a mask); at the
+    /// working resolution.
+    pub pixels_corrected: usize,
 }
 
 impl CorrectionOutput {
@@ -106,13 +109,15 @@ pub fn bin_frames(frames: &[Array2<f32>], bin: usize) -> Vec<Array2<f32>> {
         .collect()
 }
 
-/// Synchronous correction of a whole stack. `bin > 1` runs a spatially
+/// Synchronous correction of a whole stack, or of the pixels `mask`
+/// selects (the others keep their input values). `bin > 1` runs a spatially
 /// binned preview. Progress arrives as `(stage, fraction)`; setting `cancel`
 /// aborts at the solver's next iteration.
 pub fn run_correction(
     stack: &ImageStack,
     params: CorrectionParams,
     bin: usize,
+    mask: Option<&Array2<bool>>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str, f32),
 ) -> Result<CorrectionOutput> {
@@ -130,16 +135,49 @@ pub fn run_correction(
         Some(f) => (f.nrows(), f.ncols()),
         None => anyhow::bail!("empty stack"),
     };
-    let x = frames_to_matrix(&work_frames, h, w);
+    if let Some(m) = mask
+        && m.dim() != (stack.height, stack.width)
+    {
+        anyhow::bail!(
+            "the mask is {}×{} px, the stack {}×{}",
+            m.ncols(),
+            m.nrows(),
+            stack.width,
+            stack.height
+        );
+    }
+    let work_mask = mask.map(|m| crate::mask::bin_mask(m, bin));
+    let selected: Option<Vec<usize>> = work_mask
+        .as_ref()
+        .map(|m| m.iter().enumerate().filter(|(_, keep)| **keep).map(|(i, _)| i).collect());
+    if selected.as_ref().is_some_and(|s| s.is_empty()) {
+        anyhow::bail!("the mask selects no pixel");
+    }
+    let x = match &selected {
+        Some(rows) => selected_rows_to_matrix(&work_frames, rows),
+        None => frames_to_matrix(&work_frames, h, w),
+    };
+    let pixels_corrected = x.nrows();
     progress("Preparing data", 1.0);
-
     let denoised = hyper_denoise(x, &params.to_hsnt(), cancel, progress)?;
-
     progress("Assembling corrected stack", 0.0);
-    let frames = matrix_to_frames(&denoised, h, w);
+    let frames = match &selected {
+        // Only the selected pixels change; the others keep their input values.
+        Some(rows) => {
+            let mut frames = work_frames.clone();
+            for (i, frame) in frames.iter_mut().enumerate() {
+                let col = denoised.column(i);
+                let flat = frame.as_slice_mut().expect("standard layout");
+                for (k, &p) in rows.iter().enumerate() {
+                    flat[p] = col[k];
+                }
+            }
+            frames
+        }
+        None => matrix_to_frames(&denoised, h, w),
+    };
     let integrated_mean = integrated_mean(&frames, h, w);
     progress("Assembling corrected stack", 1.0);
-
     Ok(CorrectionOutput {
         frames,
         integrated_mean,
@@ -147,6 +185,7 @@ pub fn run_correction(
         bin,
         subspace_dimension: params.to_hsnt().subspace_dimension(),
         elapsed_seconds: started.elapsed().as_secs_f64(),
+        pixels_corrected,
     })
 }
 
@@ -173,7 +212,7 @@ pub fn start_correction(
             });
             ctx.request_repaint();
         };
-        let result = run_correction(&stack, params, bin, &cancel, &mut progress);
+        let result = run_correction(&stack, params, bin, None, &cancel, &mut progress);
         let _ = tx.send(CorrectionMsg::Done(result.map_err(|e| format!("{e:#}"))));
         ctx.request_repaint();
     });
@@ -191,6 +230,21 @@ pub fn frames_to_matrix(frames: &[Array2<f32>], h: usize, w: usize) -> Array2<f6
         let mut col = x.column_mut(i);
         for (dst, &v) in col.iter_mut().zip(frame.iter()) {
             *dst = f64::from(v);
+        }
+    }
+    x
+}
+
+/// The (selected points × bands) matrix of the pixels at the row-major
+/// indices `rows` (what the mask keeps), in that order.
+fn selected_rows_to_matrix(frames: &[Array2<f32>], rows: &[usize]) -> Array2<f64> {
+    let n = frames.len();
+    let mut x = Array2::<f64>::zeros((rows.len(), n));
+    for (i, frame) in frames.iter().enumerate() {
+        let flat = frame.as_slice().expect("standard layout");
+        let mut col = x.column_mut(i);
+        for (dst, &p) in col.iter_mut().zip(rows) {
+            *dst = f64::from(flat[p]);
         }
     }
     x
@@ -277,13 +331,47 @@ mod tests {
                 ..Default::default()
             },
             2,
+            None,
             &cancel,
             &mut |_, _| {},
         )
         .unwrap();
         assert!(out.is_preview());
+        assert_eq!(out.pixels_corrected, 16);
         assert_eq!(out.frames[0].dim(), (4, 4));
         assert_eq!(out.binned_raw.as_ref().unwrap()[0].dim(), (4, 4));
         assert_eq!(out.frames.len(), 6);
+    }
+
+    #[test]
+    fn masked_run_corrects_only_the_selected_pixels() {
+        let frames: Vec<Array2<f32>> = (0..6)
+            .map(|i| {
+                Array2::from_shape_fn((8, 8), |(y, x)| {
+                    // Left half: a smooth sample; right half: zero fill.
+                    if x < 4 { 1.0 + (i as f32) * 0.1 + ((y + x) as f32) * 0.01 } else { 0.0 }
+                })
+            })
+            .collect();
+        let stack = make_stack(frames.clone());
+        let mask = Array2::from_shape_fn((8, 8), |(_, x)| x < 4);
+        let cancel = AtomicBool::new(false);
+        let params = CorrectionParams { max_iter: 60, ..Default::default() };
+        let out = run_correction(&stack, params, 1, Some(&mask), &cancel, &mut |_, _| {}).unwrap();
+        assert_eq!(out.pixels_corrected, 32);
+        assert_eq!(out.frames.len(), 6);
+        for (i, f) in out.frames.iter().enumerate() {
+            for y in 0..8 {
+                for x in 4..8 {
+                    assert_eq!(f[(y, x)], frames[i][(y, x)], "outside the mask keeps its value");
+                }
+            }
+        }
+        // A wrong-sized mask is refused.
+        let bad = Array2::from_elem((4, 4), true);
+        assert!(run_correction(&stack, params, 1, Some(&bad), &cancel, &mut |_, _| {}).is_err());
+        // An empty mask too.
+        let none = Array2::from_elem((8, 8), false);
+        assert!(run_correction(&stack, params, 1, Some(&none), &cancel, &mut |_, _| {}).is_err());
     }
 }

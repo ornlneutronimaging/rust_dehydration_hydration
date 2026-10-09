@@ -95,6 +95,16 @@ pipeline integration. `--bin N` runs spatially binned. `--run-number N` can
 replace the INPUT path: the autoreduce TIFFs of a Timepix run (or the raw
 image(s) of any other run) are located from the run's NeXus file.
 
+`--mask FILE` corrects only the pixels a mask image selects (TIFF or `.npy`
+the size of the frames, nonzero = keep, read with the stack's detector
+orientation like the frames): the `<folder>_sample_mask.tif` that
+`rust_sample_masker` writes beside a masked stack is made for it. The other
+pixels do not enter the NMF and keep their input values. Without the mask, a
+masked-out region filled with 0 (or NaN, zeroed on load) would be fitted as
+an opaque flat "material" — a transmission of 0 is an attenuation of
+ln(1000) in every band — and pull the spectra of the real sample. The
+provenance file records the mask under `"mask"`.
+
 The **ℹ mbirtorch** button (top-right) shows the algorithm provenance: the
 mbirtorch version the implementation is a port of (0.1.1, tracked as a
 constant in `src/app.rs` — bump it after diffing the denoising functions of

@@ -11,6 +11,7 @@ use dehydration_hydration::correction::{run_correction, CorrectionParams, MATERI
 use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt::DatasetType;
 use dehydration_hydration::loader;
+use dehydration_hydration::mask;
 use dehydration_hydration::nmf::BetaLoss;
 use dehydration_hydration::run_lookup;
 use std::path::PathBuf;
@@ -57,6 +58,15 @@ OPTIONS:
   --max-iter <N>           NMF iteration cap (default 300)
   --bin <B>                Spatial binning factor (default 1 = full
                            resolution; >1 exports a binned preview)
+  --mask <FILE>            Correct only the pixels this image selects (TIFF
+                           or .npy, same size as the frames, nonzero = keep):
+                           e.g. the <folder>_sample_mask.tif the sample masker
+                           writes beside a masked stack. The other pixels do
+                           not enter the NMF and keep their input values —
+                           a masked-out region filled with 0 would otherwise
+                           act as an opaque material (attenuation ln(1000))
+                           and pull the spectra. Read with the stack's
+                           detector orientation, like the frames
   -t, --offset <MICROSEC>  Detector offset: constant added to the TOF values
                            of the spectra file (µs, default 0); shifts the
                            TOF and wavelength axes of the profile plots
@@ -83,6 +93,8 @@ struct Cli {
     bin: usize,
     offset_us: f64,
     detector: Option<loader::Detector>,
+    /// `--mask`: correct only the pixels this image selects.
+    mask_file: Option<PathBuf>,
     /// `--run-number`: locate the data from the run's NeXus file.
     run_number: Option<u32>,
     /// `--ipts`: pre-select the experiment the open dialogs start in.
@@ -98,6 +110,7 @@ fn parse_args() -> Result<Cli, String> {
         bin: 1,
         offset_us: 0.0,
         detector: None,
+        mask_file: None,
         run_number: None,
         ipts: None,
     };
@@ -180,6 +193,7 @@ fn parse_args() -> Result<Cli, String> {
                     return Err(format!("--offset must be finite (got {})", cli.offset_us));
                 }
             }
+            "--mask" => cli.mask_file = Some(PathBuf::from(value("--mask")?)),
             "--detector" => {
                 let v = value("--detector")?;
                 cli.detector = Some(loader::Detector::parse(&v).ok_or_else(|| {
@@ -287,10 +301,32 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         cli.params.num_materials * MATERIALS_FACTOR,
         cli.params.safety_factor
     );
-    let out = run_correction(&stack, cli.params, cli.bin, &cancel, &mut progress)?;
+    // The mask, read with the stack's detector orientation so it lines up.
+    let mask = match &cli.mask_file {
+        Some(path) => {
+            let m = mask::load_file(path, stack.detector)?;
+            let n = mask::count(&m);
+            eprintln!(
+                "Mask {}: {n} of {} pixel(s) selected ({:.1}%); the others keep their input values.",
+                path.display(),
+                m.len(),
+                100.0 * n as f64 / m.len().max(1) as f64
+            );
+            Some((path.clone(), m))
+        }
+        None => None,
+    };
+    let out = run_correction(
+        &stack,
+        cli.params,
+        cli.bin,
+        mask.as_ref().map(|(_, m)| m),
+        &cancel,
+        &mut progress,
+    )?;
     eprintln!(
-        "Correction done in {:.1} s (subspace dimension {}).",
-        out.elapsed_seconds, out.subspace_dimension
+        "Correction done in {:.1} s (subspace dimension {}, {} pixel(s) corrected).",
+        out.elapsed_seconds, out.subspace_dimension, out.pixels_corrected
     );
 
     let input_dir = files
@@ -312,6 +348,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         subspace_dimension: out.subspace_dimension,
         bin: out.bin,
         elapsed_seconds: out.elapsed_seconds,
+        mask: mask.as_ref().map(|(path, m)| (path.clone(), mask::count(m))),
     };
     let folder = export_corrected(
         cli.output.as_deref().expect("checked in parse_args"),
@@ -353,6 +390,9 @@ fn main() -> eframe::Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+    if cli.mask_file.is_some() {
+        eprintln!("Warning: --mask only applies to headless runs (--run); the window corrects the whole stack.");
     }
 
     let native_options = eframe::NativeOptions {

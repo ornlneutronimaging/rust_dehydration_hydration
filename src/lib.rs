@@ -13,6 +13,7 @@ pub mod export;
 pub mod hsnt;
 pub mod linalg;
 pub mod loader;
+pub mod mask;
 pub mod nmf;
 pub mod recent;
 pub mod run_lookup;
