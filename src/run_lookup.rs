@@ -268,6 +268,50 @@ pub fn names_run(name: &str, run: u32) -> bool {
     false
 }
 
+/// The run number carried by a file or folder name (`…_Run_23640_…`,
+/// `run_24671.tiff`), if any: the digits after `run_` (any case) up to a
+/// `_`, `.`, `-`, a space or the end of the name. The first such run wins.
+pub fn run_number_in(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("run_") {
+        let start = from + pos + "run_".len();
+        let digits = lower[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let end = start + digits;
+        let terminated = matches!(
+            lower[end..].chars().next(),
+            None | Some('_') | Some('.') | Some('-') | Some(' ')
+        );
+        if digits > 0 && terminated && let Ok(run) = lower[start..end].parse::<u32>() {
+            return Some(run);
+        }
+        from = start;
+    }
+    None
+}
+
+/// The run an image path belongs to: from its file name (VENUS names every
+/// frame `…_Run_<run>_…`), else from its folder's name (a Timepix autoreduce
+/// folder is named after its run too).
+pub fn run_number_of(path: &Path) -> Option<u32> {
+    let name_of = |p: &Path| p.file_name().and_then(|n| run_number_in(&n.to_string_lossy()));
+    name_of(path).or_else(|| path.parent().and_then(name_of))
+}
+
+/// The detector offset recorded with a run, for a stack that was loaded by
+/// hand (see [`run_number_of`]): the run's NeXus file and its
+/// [`OFFSET_LOG`] value in µs — `None` when the file has no such log.
+pub fn run_offset(run: u32) -> Result<(PathBuf, Option<f64>)> {
+    let (_ipts, nexus) = find_nexus(run)?;
+    let file = hdf5::File::open(&nexus)
+        .with_context(|| format!("cannot open {} as HDF5", nexus.display()))?;
+    let offset_us = read_offset_us(&file).ok().flatten();
+    Ok((nexus, offset_us))
+}
+
 fn ext_of(path: &Path) -> Option<String> {
     path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
 }
@@ -477,6 +521,44 @@ mod tests {
         // A shorter run number embedded in a longer one still needs the
         // exact `Run_<run>_` somewhere.
         assert!(names_run("Run_158051_x_Run_15805_y.tiff", 15805));
+    }
+
+    #[test]
+    fn run_number_is_read_out_of_a_name() {
+        assert_eq!(
+            run_number_in("20260613_Run_23640_LF99D_Rnd2_Coarsen_0_416C_0_000AngsMin_0_770_00000.tif"),
+            Some(23640)
+        );
+        assert_eq!(run_number_in("20260320_Run_15805_Compass_CT_Ang_0_000_1.tiff"), Some(15805));
+        assert_eq!(run_number_in("run_24671.tiff"), Some(24671));
+        assert_eq!(run_number_in("Run_24671"), Some(24671));
+        assert_eq!(run_number_in("Run_24671-ob.tif"), Some(24671));
+        // A name without a run (a date is not one), or with a malformed one.
+        assert_eq!(run_number_in("20260430_BPR_RT_0_464C_0_000AngsMin"), None);
+        assert_eq!(run_number_in("run_abc_1.tif"), None);
+        assert_eq!(run_number_in("Run_123x_1.tif"), None);
+        // The first well-formed run wins; a malformed one is skipped.
+        assert_eq!(run_number_in("Run_123x_Run_456_1.tif"), Some(456));
+        assert_eq!(run_number_in("dehydrated_hydrated_Run_23640"), Some(23640));
+
+        // From the path: the file name first, then the folder.
+        assert_eq!(run_number_of(Path::new("/a/Run_1/x_Run_2_0.tif")), Some(2));
+        assert_eq!(run_number_of(Path::new("/a/Run_1/x_00000.tif")), Some(1));
+        assert_eq!(run_number_of(Path::new("/a/b/x_00000.tif")), None);
+    }
+
+    /// The offset lookup against real instrument data; skipped when
+    /// /SNS/VENUS is not mounted.
+    #[test]
+    fn run_offset_real_run() {
+        if !Path::new(VENUS_ROOT).is_dir() {
+            eprintln!("skipping: {VENUS_ROOT} not mounted");
+            return;
+        }
+        let (nexus, offset) = run_offset(23640).expect("offset of run 23640");
+        assert!(nexus.ends_with("VENUS_23640.nxs.h5"), "{}", nexus.display());
+        assert!(offset.is_some_and(|v| v.is_finite()), "{offset:?}");
+        assert!(run_offset(0).is_err());
     }
 
     #[test]

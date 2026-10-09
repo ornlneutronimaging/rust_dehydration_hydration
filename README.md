@@ -71,17 +71,19 @@ checked out.
    (`-r/--run-number N`, NeXus lookup: detector, image folder and detector
    offset; a Timepix run asks for raw or autoreduce data, autoreduce being
    the loadable one). Folders and TIFF / `.npy` files can be dragged onto the
-   window. Files load in parallel; NaN/Inf pixels are zeroed.
+   window. Files load in parallel; NaN/Inf pixels are zeroed. When the file
+   (or folder) names carry a run number (`…_Run_<N>_…`), the detector
+   offset is read from that run's NeXus file, unless `-t/--offset` gave one.
 2. **Raw data** view — slide through the images next to the integrated image.
 3. **Correction parameters** (left panel) — the options of
    `mbirtorch-hsnt denoise`:
    - **Input type** — `transmission` (default: the normalized stacks this tool
      loads), `attenuation` (= −log(transmission)) or `auto` (inferred from the
      values; fails when non-negative values above 1.05 cannot be told apart).
-   - **Rank** — `auto` (estimated from the data by likelihood-ratio tests, at
-     full resolution and on pooled pixels; **Max rank** bounds the search,
-     default 6) or `fixed` N. About the number of distinct materials; the
-     components span the materials' spectra but need not be the materials.
+   - **Number of materials** — `auto` (estimated from the data by
+     likelihood-ratio tests, at full resolution and on pooled pixels;
+     **Max materials** bounds the search, default 6) or `fixed` N. This is
+     hsnt's *rank*: the fitted components span the materials' spectra.
    - **Spectra** — `mle` (default), `unconstrained` (removes a low-dose bias,
      worth it with many pixels), `support` (per-pixel component selection,
      zeroes the background of the maps; **needs the dose**).
@@ -123,7 +125,8 @@ checked out.
    The profile series have fixed colors — uncorrected orange ✕, corrected
    blue ● — and the marker glyph is in the legend text.
 8. **💾 Export corrected images…** — 32-bit float TIFFs (input names kept) in
-   `<input-folder>_dehydration_hydration_corrected[_N]`, plus
+   `dehydrated_hydrated_<input-folder>[_N]`, plus a copy of the input
+   folder's `*_Spectra.txt` (so the TOF axis follows the corrected stack),
    `correction_config.json` (parameters, CLI arguments, mbirtorch commit, the
    fit summary) and the run's by-products: `hsnt_report.json`,
    `hsnt_dehydrated.h5` (`subspace_data` maps, `subspace_basis` spectra,
@@ -142,7 +145,7 @@ becomes the input type and its `num_materials` the (fixed) rank.
 ```bash
 dehydration_hydration /SNS/VENUS/IPTS-XXXX/.../Run_YYYY \
     --run --output /path/to/output \
-    --input-type transmission --rank auto --spectra mle [--dose 50] [--device cuda:1]
+    --input-type transmission --materials auto --spectra mle [--dose 50] [--device cuda:1]
 ```
 
 Same load → correct → export pipeline without a window (the CLI's log is
@@ -152,7 +155,8 @@ relayed on stderr, indented; the created folder is printed on stdout).
 `--mask-include x0,y0,x1,y1` / `--mask-exclude x0,y0,x1,y1` (repeatable,
 half-open pixel bounds in the oriented frame) and `--mask-range LO:HI` on
 the integrated image. For scripts written against the
-production tool, `--materials N` means `--rank N`, `--dataset-type` means
+production tool, `--materials N` works unchanged (`--rank` is the hsnt
+synonym), `--dataset-type` means
 `--input-type`, `--max-iter` means `--max-steps`, and `--beta-loss` /
 `--safety-factor` are accepted and ignored with a warning — so the Workflow
 Runner can be pointed at this binary with `WORKFLOW_DEHY_BIN`.

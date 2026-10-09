@@ -87,6 +87,10 @@ enum View {
 /// Messages sent from the background loading thread to the UI.
 enum LoadMsg {
     Progress { done: usize, total: usize },
+    /// The detector offset of the run the file names belong to (sent before
+    /// `Done`): the NeXus file found and its offset, or why the lookup
+    /// failed (unmounted /SNS/VENUS, no NeXus file for that run…).
+    RunOffset { run: u32, result: Result<(PathBuf, Option<f64>), String> },
     Done(anyhow::Result<ImageStack>),
 }
 
@@ -94,6 +98,8 @@ struct LoadJob {
     rx: Receiver<LoadMsg>,
     done: usize,
     total: usize,
+    /// The `RunOffset` message, kept until the stack is in.
+    run_offset: Option<(u32, Result<(PathBuf, Option<f64>), String>)>,
 }
 
 /// The "Run number…" dialog: locate a run's images from its run number
@@ -403,6 +409,12 @@ pub struct DehydrationApp {
     x_axis: XAxis,
     /// Source–detector distance for the wavelength conversion (m).
     distance_m: f64,
+    /// Set when the offset was given on the command line (`--offset`): a
+    /// stack loaded by hand then keeps it instead of the run's NeXus value.
+    offset_pinned: bool,
+    /// The run whose NeXus offset is in effect, to skip looking it up again
+    /// when the same files are reloaded (e.g. detector change).
+    offset_run: Option<u32>,
     /// Detector offset: constant added to the spectra file's TOF values, in µs
     /// (also shifts the wavelength axis).
     offset_us: f64,
@@ -490,6 +502,8 @@ impl DehydrationApp {
             spectra_tof_us: None,
             x_axis: XAxis::Index,
             distance_m: spectra::DEFAULT_DISTANCE_M,
+            offset_pinned: false,
+            offset_run: None,
             offset_us: 0.0,
             scale: 1.0,
             fit_requested: false,
@@ -505,6 +519,7 @@ impl DehydrationApp {
     /// values, in µs (the `-t/--offset` command-line option).
     pub fn set_detector_offset(&mut self, offset_us: f64) {
         self.offset_us = offset_us;
+        self.offset_pinned = true;
     }
 
     /// Correction parameters given on the command line.
@@ -623,6 +638,8 @@ impl DehydrationApp {
         let running = self.corr_job.is_some();
         let mut text = self.run_log.join("\n");
         let n_lines = self.run_log.len();
+        let warnings: Vec<String> =
+            self.result.as_ref().map(|r| r.report.warnings.clone()).unwrap_or_default();
         let mut open = true;
         egui::Window::new("📜 mbirtorch hsnt log")
             .open(&mut open)
@@ -638,6 +655,17 @@ impl DehydrationApp {
                         ui.ctx().copy_text(text.clone());
                     }
                 });
+                if !warnings.is_empty() && !running {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 160, 30),
+                        format!("⚠ {} warning(s) in the last run:", warnings.len()),
+                    );
+                    for w in &warnings {
+                        ui.label(format!("  • {w}"));
+                    }
+                    ui.separator();
+                }
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(running)
                     .show(ui, |ui| {
@@ -1055,7 +1083,9 @@ impl DehydrationApp {
     }
 
     /// Load `paths`, with the `BL10:Exp:Det` DASlog value of their run when
-    /// they were located from a run number.
+    /// they were located from a run number. Paths picked by hand whose
+    /// names carry a run number (`…_Run_<run>_…`) get the detector offset
+    /// of that run from its NeXus file, unless `--offset` pinned one.
     /// Returns whether the load started (`false` while a correction or an
     /// export is running).
     fn start_load_from(&mut self, paths: Vec<PathBuf>, daslog: Option<String>, ctx: &egui::Context) -> bool {
@@ -1068,6 +1098,15 @@ impl DehydrationApp {
         }
         let total = paths.len();
         let detector = self.detector_for(&paths, daslog.as_deref());
+        // A run located from its number already applied its offset.
+        let lookup_run = if daslog.is_none() && !self.offset_pinned {
+            paths
+                .first()
+                .and_then(|p| run_lookup::run_number_of(p))
+                .filter(|&run| self.offset_run != Some(run))
+        } else {
+            None
+        };
         self.input_files = paths.clone();
         self.input_daslog = daslog;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1082,10 +1121,14 @@ impl DehydrationApp {
                 }
                 ctx.request_repaint();
             });
+            if let Some(run) = lookup_run {
+                let result = run_lookup::run_offset(run).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(LoadMsg::RunOffset { run, result });
+            }
             let _ = tx.send(LoadMsg::Done(result));
             ctx.request_repaint();
         });
-        self.loading = Some(LoadJob { rx, done: 0, total });
+        self.loading = Some(LoadJob { rx, done: 0, total, run_offset: None });
         self.status = format!("Loading {total} file(s)…");
         true
     }
@@ -1099,17 +1142,47 @@ impl DehydrationApp {
                         job.done = done;
                         job.total = total;
                     }
+                    LoadMsg::RunOffset { run, result } => job.run_offset = Some((run, result)),
                     LoadMsg::Done(res) => result = Some(res),
                 }
             }
         }
         if let Some(res) = result {
-            self.loading = None;
+            let run_offset = self.loading.take().and_then(|job| job.run_offset);
             match res {
-                Ok(stack) => self.apply_stack(stack),
+                Ok(stack) => {
+                    self.apply_stack(stack);
+                    if let Some((run, result)) = run_offset {
+                        self.apply_run_offset(run, result);
+                    }
+                }
                 Err(e) => self.status = format!("Load failed: {e:#}"),
             }
         }
+    }
+
+    /// Apply the detector offset looked up from the run number in the file
+    /// names, and say so in the status line (after the load summary).
+    fn apply_run_offset(&mut self, run: u32, result: Result<(PathBuf, Option<f64>), String>) {
+        let note = match result {
+            Ok((nexus, Some(offset))) => {
+                self.offset_us = offset;
+                self.offset_run = Some(run);
+                let file = nexus
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("Run {run}: detector offset {offset:.3} µs from {file}.")
+            }
+            Ok((nexus, None)) => format!(
+                "Run {run}: no {} log in {} — detector offset kept at {:.3} µs.",
+                run_lookup::OFFSET_LOG,
+                nexus.display(),
+                self.offset_us
+            ),
+            Err(e) => format!("Run {run}: detector offset not looked up ({e}).",),
+        };
+        self.status = format!("{} {note}", self.status.trim_end());
     }
 
     fn apply_stack(&mut self, stack: ImageStack) {
@@ -1241,20 +1314,17 @@ impl DehydrationApp {
                 let rank = out
                     .report
                     .rank
-                    .map(|r| format!("rank {r}"))
-                    .unwrap_or_else(|| "rank unknown".to_owned());
+                    .map(|r| format!("{r} material(s)"))
+                    .unwrap_or_else(|| "number of materials unknown".to_owned());
                 let chi2 = out
                     .report
                     .reduced_chi2
                     .map(|c| format!(", reduced chi-square {c:.2}"))
                     .unwrap_or_default();
-                let warn = if out.report.warnings.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {} warning(s), see the log", out.report.warnings.len())
-                };
+                // Warnings are not spelled out here: the status bar shows a
+                // button that opens the log, with them listed on top.
                 self.status = format!(
-                    "Correction done in {:.1} s ({rank}{chi2}){preview_note}{warn}.",
+                    "Correction done in {:.1} s ({rank}{chi2}){preview_note}.",
                     out.elapsed_seconds
                 );
                 self.result = Some(ResultState {
@@ -1309,12 +1379,7 @@ impl DehydrationApp {
                 "Preview results are binned — run the full correction before exporting.".to_owned();
             return;
         }
-        let input_dir_name = self
-            .input_dir
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "images".to_owned());
+        let input_dir = self.input_dir.clone().unwrap_or_default();
         let mut dialog = rfd::FileDialog::new()
             .set_title("Choose the folder that will receive the corrected images");
         if let Some(parent) = self.input_dir.as_ref().and_then(|p| p.parent()) {
@@ -1325,7 +1390,7 @@ impl DehydrationApp {
         };
         let (h, w) = result.dims();
         let provenance = Provenance {
-            input_folder: self.input_dir.clone().unwrap_or_default(),
+            input_folder: input_dir.clone(),
             num_images: result.frames.len(),
             image_width: w,
             image_height: h,
@@ -1342,7 +1407,7 @@ impl DehydrationApp {
         };
         let rx = start_export(
             output_dir,
-            input_dir_name,
+            input_dir,
             result.frames.clone(),
             stack.sources.clone(),
             stack.orientation,
@@ -2610,17 +2675,17 @@ impl DehydrationApp {
             );
             ui.add_space(6.0);
 
-            // Rank: estimated by the CLI, or given.
+            // Number of materials (hsnt rank): estimated by the CLI, or given.
             let mut auto = self.params.rank == Rank::Auto;
             if let Rank::Fixed(n) = self.params.rank {
                 self.fixed_rank = n;
             }
             ui.horizontal(|ui| {
-                ui.label("Rank");
+                ui.label("Number of materials");
                 if ui
                     .selectable_label(auto, "auto")
                     .on_hover_text(
-                        "Estimate the number of components from the data by likelihood-ratio \
+                        "Estimate the number of materials from the data by likelihood-ratio \
                          tests (at full resolution and on pooled pixels)",
                     )
                     .clicked()
@@ -2629,7 +2694,7 @@ impl DehydrationApp {
                 }
                 if ui
                     .selectable_label(!auto, "fixed")
-                    .on_hover_text("Give the number of components yourself")
+                    .on_hover_text("Give the number of materials yourself")
                     .clicked()
                 {
                     auto = false;
@@ -2641,15 +2706,15 @@ impl DehydrationApp {
             });
             ui.label(
                 egui::RichText::new(
-                    "Number of components ≈ number of distinct materials; the components \
-                     span the materials' spectra but need not be the materials themselves",
+                    "Number of distinct materials in the field of view (the hsnt rank); \
+                     the fitted components span the materials' spectra",
                 )
                 .small()
                 .weak(),
             );
             if auto {
-                ui.add(egui::Slider::new(&mut self.params.max_rank, 1..=12).text("Max rank"))
-                    .on_hover_text("Largest number of components the estimate considers");
+                ui.add(egui::Slider::new(&mut self.params.max_rank, 1..=12).text("Max materials"))
+                    .on_hover_text("Largest number of materials the estimate considers");
             }
             self.params.rank = if auto {
                 Rank::Auto
@@ -2829,14 +2894,14 @@ impl DehydrationApp {
             let r = &result.report;
             match r.rank {
                 Some(rank) => {
-                    ui.label(format!("Rank {rank}")).on_hover_text(if r.rank_note.is_empty() {
-                        "number of components"
+                    ui.label(format!("Number of materials: {rank}")).on_hover_text(if r.rank_note.is_empty() {
+                        "number of materials (the hsnt rank)"
                     } else {
                         r.rank_note.as_str()
                     });
                 }
                 None => {
-                    ui.label("Rank: not reported");
+                    ui.label("Number of materials: not reported");
                 }
             }
             if !r.rank_note.is_empty() {
@@ -2951,6 +3016,20 @@ impl DehydrationApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
+            // The warnings of the last run: one click opens the log, with
+            // them listed on top.
+            let n_warnings = self.result.as_ref().map_or(0, |r| r.report.warnings.len());
+            if n_warnings > 0
+                && ui
+                    .button(
+                        egui::RichText::new(format!("⚠ {n_warnings} warning(s) — show log"))
+                            .color(egui::Color32::from_rgb(230, 160, 30)),
+                    )
+                    .on_hover_text("Open the mbirtorch hsnt log, the warnings listed first")
+                    .clicked()
+            {
+                self.show_log = true;
+            }
             if let Some(stack) = &self.stack {
                 ui.separator();
                 ui.label(format!(

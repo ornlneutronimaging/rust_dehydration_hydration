@@ -2,8 +2,9 @@
 //! image, keeping the input file names) together with a provenance file
 //! (`correction_config.json`) recording exactly how they were produced, and
 //! the by-products of the mbirtorch run (its JSON report, the dehydrated
-//! maps + spectra file, the PNG plots and the log). Also: CSV export of the
-//! profile plots.
+//! maps + spectra file, the PNG plots and the log), and a copy of the input
+//! folder's `*_Spectra.txt` so the exported stack keeps its TOF axis. Also:
+//! CSV export of the profile plots.
 //!
 //! [`export_corrected`] is the synchronous, GUI-free core (also used by the
 //! headless `--run` mode); [`start_export`] wraps it on a background thread
@@ -44,11 +45,15 @@ pub struct MaskInfo {
     pub description: String,
 }
 
-/// `<output>/<input-folder-name>_dehydration_hydration_corrected`, suffixed
-/// `_1`, `_2`, … when it already exists (the notebook's
-/// `make_or_increment_folder_name`). The folder is created.
+/// Prefix of the export folder name, in front of the input folder's name.
+pub const EXPORT_PREFIX: &str = "dehydrated_hydrated_";
+
+/// `<output>/dehydrated_hydrated_<input-folder-name>`, suffixed `_1`, `_2`, …
+/// when it already exists (the notebook's `make_or_increment_folder_name`).
+/// The input folder's name is kept whole so the export is easy to match
+/// back to its run. The folder is created.
 pub fn make_export_folder(output_dir: &Path, input_dir_name: &str) -> Result<PathBuf> {
-    let base = output_dir.join(format!("{input_dir_name}_dehydration_hydration_corrected"));
+    let base = output_dir.join(format!("{EXPORT_PREFIX}{input_dir_name}"));
     let mut candidate = base.clone();
     let mut i = 0;
     while candidate.exists() {
@@ -87,13 +92,38 @@ pub fn output_name(input: &Path) -> String {
     format!("{stem}.tif")
 }
 
-/// Write the corrected stack + provenance file + the run's by-products into
-/// a fresh export folder under `output_dir`, reporting `(files_done,
-/// files_total)`. Returns the created folder.
+/// Name of the export folder for an input folder: its own name (`images`
+/// when the path has none) behind [`EXPORT_PREFIX`].
+pub fn input_dir_name(input_dir: &Path) -> String {
+    input_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "images".to_owned())
+}
+
+/// Copy the input folder's `*_Spectra.txt` (the TOF axis of the stack) into
+/// the export folder, keeping its name. Nothing to do when there is none.
+/// Returns the copied file's path.
+pub fn copy_spectra_file(input_dir: &Path, folder: &Path) -> Result<Option<PathBuf>> {
+    let Some(src) = crate::spectra::find_spectra_file(input_dir) else {
+        return Ok(None);
+    };
+    let name = src.file_name().expect("find_spectra_file returns files");
+    let dst = folder.join(name);
+    std::fs::copy(&src, &dst)
+        .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    Ok(Some(dst))
+}
+
+/// Write the corrected stack + provenance file + the run's by-products +
+/// the input folder's spectra file into a fresh export folder under
+/// `output_dir`, reporting `(files_done, files_total)`. Returns the created
+/// folder.
 #[allow(clippy::too_many_arguments)]
 pub fn export_corrected(
     output_dir: &Path,
-    input_dir_name: &str,
+    input_dir: &Path,
     frames: &[Array2<f32>],
     sources: &[PathBuf],
     orientation: Orientation,
@@ -101,7 +131,7 @@ pub fn export_corrected(
     artifacts: &[Artifact],
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<PathBuf> {
-    let folder = make_export_folder(output_dir, input_dir_name)?;
+    let folder = make_export_folder(output_dir, &input_dir_name(input_dir))?;
     let total = frames.len();
     for (i, frame) in frames.iter().enumerate() {
         let name = sources
@@ -118,6 +148,7 @@ pub fn export_corrected(
         std::fs::write(folder.join(&a.name), &a.bytes)
             .with_context(|| format!("write {} in {}", a.name, folder.display()))?;
     }
+    copy_spectra_file(input_dir, &folder)?;
     Ok(folder)
 }
 
@@ -253,7 +284,7 @@ pub enum ExportMsg {
 #[allow(clippy::too_many_arguments)]
 pub fn start_export(
     output_dir: PathBuf,
-    input_dir_name: String,
+    input_dir: PathBuf,
     frames: std::sync::Arc<Vec<Array2<f32>>>,
     sources: Vec<PathBuf>,
     orientation: Orientation,
@@ -271,7 +302,7 @@ pub fn start_export(
         };
         let result = export_corrected(
             &output_dir,
-            &input_dir_name,
+            &input_dir,
             &frames,
             &sources,
             orientation,
@@ -322,9 +353,16 @@ mod tests {
         let a = make_export_folder(&dir, "Run_1234").unwrap();
         let b = make_export_folder(&dir, "Run_1234").unwrap();
         let c = make_export_folder(&dir, "Run_1234").unwrap();
-        assert!(a.ends_with("Run_1234_dehydration_hydration_corrected"));
-        assert!(b.ends_with("Run_1234_dehydration_hydration_corrected_1"));
-        assert!(c.ends_with("Run_1234_dehydration_hydration_corrected_2"));
+        assert!(a.ends_with("dehydrated_hydrated_Run_1234"));
+        assert!(b.ends_with("dehydrated_hydrated_Run_1234_1"));
+        assert!(c.ends_with("dehydrated_hydrated_Run_1234_2"));
+    }
+
+    #[test]
+    fn input_dir_name_keeps_the_folder_name() {
+        assert_eq!(input_dir_name(Path::new("/data/IPTS-1/Run_1234")), "Run_1234");
+        assert_eq!(input_dir_name(Path::new("/data/IPTS-1/Run_1234/")), "Run_1234");
+        assert_eq!(input_dir_name(Path::new("")), "images");
     }
 
     #[test]
@@ -360,15 +398,18 @@ mod tests {
     #[test]
     fn export_writes_images_and_provenance() {
         let dir = tmp_dir("full");
+        let input = dir.join("Run_1");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("Run_1_Spectra.txt"), "1e-6,1\n2e-6,2\n").unwrap();
         let frames = vec![
             Array2::from_elem((3, 5), 1.0f32),
             Array2::from_elem((3, 5), 2.0f32),
         ];
-        let sources = vec![PathBuf::from("a_0000.tiff"), PathBuf::from("a_0001.tiff")];
+        let sources = vec![input.join("a_0000.tiff"), input.join("a_0001.tiff")];
         let mut ticks = Vec::new();
         let folder = export_corrected(
             &dir,
-            "Run_1",
+            &input,
             &frames,
             &sources,
             Orientation::Transpose,
@@ -377,9 +418,15 @@ mod tests {
             &mut |d, t| ticks.push((d, t)),
         )
         .unwrap();
+        assert!(folder.ends_with("dehydrated_hydrated_Run_1"), "{}", folder.display());
         assert!(folder.join("a_0000.tif").is_file());
         assert!(folder.join("a_0001.tif").is_file());
         assert!(folder.join("hsnt_report.json").is_file());
+        // The input folder's spectra file travels with the corrected stack.
+        assert_eq!(
+            std::fs::read_to_string(folder.join("Run_1_Spectra.txt")).unwrap(),
+            "1e-6,1\n2e-6,2\n"
+        );
         assert_eq!(ticks, vec![(1, 2), (2, 2)]);
         let json = std::fs::read_to_string(folder.join("correction_config.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -390,6 +437,30 @@ mod tests {
         assert_eq!(doc["mbirtorch_commit"], "edb0bcb (hsnt)");
         assert_eq!(doc["mask"]["pixels_selected"], 10);
         assert_eq!(doc["input_folder"], "/data/Run_1");
+    }
+
+    #[test]
+    fn export_without_spectra_file_is_fine() {
+        let dir = tmp_dir("nospectra");
+        let input = dir.join("Run_2");
+        std::fs::create_dir_all(&input).unwrap();
+        let frames = vec![Array2::from_elem((2, 2), 1.0f32)];
+        let folder = export_corrected(
+            &dir,
+            &input,
+            &frames,
+            &[input.join("b.tif")],
+            Orientation::Identity,
+            &provenance(),
+            &[],
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(folder.join("b.tif").is_file());
+        assert!(std::fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with("_Spectra.txt")));
     }
 
     #[test]

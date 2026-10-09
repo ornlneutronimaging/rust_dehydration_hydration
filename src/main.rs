@@ -49,7 +49,7 @@ OPTIONS:
                            corrected stack without opening a window
                            (requires INPUT or --run-number, and --output)
   -o, --output <DIR>       Folder receiving the corrected subfolder
-                           '<input>_dehydration_hydration_corrected'
+                           'dehydrated_hydrated_<input>'
 
   Correction (the options of `mbirtorch-hsnt denoise`):
   --input-type <TYPE>      What the values are: transmission (default — the
@@ -57,10 +57,11 @@ OPTIONS:
                            (= −log(transmission)), or auto (inferred from the
                            values; fails when they cannot be told apart).
                            --dataset-type is accepted as a synonym
-  --rank <N|auto>          Number of components, about the number of distinct
-                           materials (default auto: estimated from the data by
-                           likelihood-ratio tests). --materials N is a synonym
-  --max-rank <N>           Largest rank the estimate considers (default 6)
+  --materials <N|auto>     Number of materials (default auto: estimated from
+                           the data by likelihood-ratio tests). --rank is a
+                           synonym (hsnt's name for it)
+  --max-rank <N>           Largest number of materials the estimate considers
+                           (default 6)
   --spectra <HOW>          mle (default) | unconstrained | support — how the
                            component spectra are estimated; support needs
                            --dose
@@ -96,8 +97,11 @@ OPTIONS:
   --bin <B>                Spatial binning factor (default 1 = full
                            resolution; >1 exports a binned preview)
   -t, --offset <MICROSEC>  Detector offset: constant added to the TOF values
-                           of the spectra file (µs, default 0); shifts the
-                           TOF and wavelength axes of the profile plots
+                           of the spectra file (µs); shifts the TOF and
+                           wavelength axes of the profile plots. Without it,
+                           a loaded stack whose file names carry a run number
+                           (…_Run_<N>_…) takes the offset recorded in that
+                           run's NeXus file (else 0)
   --detector <NAME>        Force the detector the stack is loaded as, which
                            decides its orientation: timepix (frames
                            transposed), ccd (flipped vertically and horizontally), qhy (rotated 90°
@@ -127,7 +131,8 @@ struct Cli {
     output: Option<PathBuf>,
     params: CorrectionParams,
     bin: usize,
-    offset_us: f64,
+    /// `--offset`, when given (otherwise the run's NeXus value, see app).
+    offset_us: Option<f64>,
     detector: Option<loader::Detector>,
     /// `--run-number`: locate the data from the run's NeXus file.
     run_number: Option<u32>,
@@ -146,7 +151,7 @@ fn parse_args() -> Result<Cli, String> {
         output: None,
         params: CorrectionParams::default(),
         bin: 1,
-        offset_us: 0.0,
+        offset_us: None,
         detector: None,
         run_number: None,
         ipts: None,
@@ -188,10 +193,10 @@ fn parse_args() -> Result<Cli, String> {
                 cli.params.input_type = InputType::parse(&v)
                     .ok_or_else(|| format!("unknown input type '{v}': expected transmission, attenuation or auto"))?;
             }
-            "--rank" | "--materials" => {
-                let v = value("--rank")?;
+            "--materials" | "--rank" => {
+                let v = value("--materials")?;
                 cli.params.rank = Rank::parse(&v)
-                    .ok_or_else(|| format!("invalid --rank '{v}': expected a positive integer or auto"))?;
+                    .ok_or_else(|| format!("invalid --materials '{v}': expected a positive integer or auto"))?;
             }
             "--max-rank" | "--max_rank" => {
                 cli.params.max_rank = value("--max-rank")?
@@ -279,12 +284,13 @@ fn parse_args() -> Result<Cli, String> {
             }
             "-t" | "--offset" => {
                 let v = value("--offset")?;
-                cli.offset_us = v
+                let offset: f64 = v
                     .parse()
                     .map_err(|e| format!("invalid --offset '{v}': {e}"))?;
-                if !cli.offset_us.is_finite() {
-                    return Err(format!("--offset must be finite (got {})", cli.offset_us));
+                if !offset.is_finite() {
+                    return Err(format!("--offset must be finite (got {offset})"));
                 }
+                cli.offset_us = Some(offset);
             }
             "--detector" => {
                 let v = value("--detector")?;
@@ -437,13 +443,9 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    let input_dir_name = input_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "images".to_owned());
     let (h, w) = out.integrated_mean.dim();
     let provenance = Provenance {
-        input_folder: input_dir,
+        input_folder: input_dir.clone(),
         num_images: out.frames.len(),
         image_width: w,
         image_height: h,
@@ -460,7 +462,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     };
     let folder = export_corrected(
         cli.output.as_deref().expect("checked in parse_args"),
-        &input_dir_name,
+        &input_dir,
         &out.frames,
         &stack.sources,
         stack.orientation,
@@ -521,7 +523,9 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx
                 .set_zoom_factor(dehydration_hydration::zoom::load());
             let mut app = DehydrationApp::new();
-            app.set_detector_offset(offset_us);
+            if let Some(offset_us) = offset_us {
+                app.set_detector_offset(offset_us);
+            }
             app.set_detector_override(detector);
             app.set_ipts(ipts);
             app.set_params(params);
