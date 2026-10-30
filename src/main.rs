@@ -13,6 +13,7 @@ use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt_cli::{self, Compile, Device, InputType, Rank, SolveMode, Spectra};
 use dehydration_hydration::export::MaskInfo;
 use dehydration_hydration::loader;
+use dehydration_hydration::logger;
 use dehydration_hydration::mask::{MaskRect, MaskSpec, RectMode};
 use dehydration_hydration::run_lookup;
 use std::path::PathBuf;
@@ -122,7 +123,7 @@ The correction is `mbirtorch.hsnt denoise`: the maximum-likelihood (Poisson)
 factorization X = W·H of the attenuation (dehydration), multiplied back into
 denoised data (rehydration), after M. S. N. Chowdhury et al., \"Fast
 Hyperspectral Neutron Tomography\", IEEE Trans. Comput. Imaging 11, 663-677
-(2025), as re-implemented by Harel Dor (mbirtorch branch hsnt).
+(2025), as re-implemented by Harel Dor (the hsnt package of mbirtorch 0.1.2).
 ";
 
 struct Cli {
@@ -167,6 +168,7 @@ fn parse_args() -> Result<Cli, String> {
         };
         match a.as_str() {
             "-h" | "--help" => {
+                logger::log("--help requested, exiting");
                 println!("{USAGE}");
                 std::process::exit(0);
             }
@@ -272,6 +274,7 @@ fn parse_args() -> Result<Cli, String> {
             }
             "--beta-loss" | "--beta_loss" | "--safety-factor" | "--safety_factor" => {
                 let v = value(&a)?;
+                logger::warn(format!("{a} {v} is an option of the production NMF tool; the beta ignores it"));
                 eprintln!("Warning: {a} {v} is an option of the production NMF tool; the beta ignores it.");
             }
             "--bin" => {
@@ -323,6 +326,7 @@ fn expand_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
             match loader::list_supported_in_dir(input) {
                 Ok(found) => files.extend(found),
                 Err(e) => {
+                    logger::error(format!("Input folder {}: {e:#}", input.display()));
                     eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
@@ -343,9 +347,10 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut daslog: Option<String> = None;
     if let Some(run) = cli.run_number {
         eprintln!("Locating run {run}…");
+        logger::log(format!("Headless: locating run {run}…"));
         let info = run_lookup::resolve(run)?;
         let (run_files, which) = info.default_files()?;
-        eprintln!(
+        let msg = format!(
             "Run {run}: {}, {} — {which} data, {} file(s) in {}",
             info.ipts,
             info.detector_text(),
@@ -356,11 +361,22 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         );
+        eprintln!("{msg}");
+        logger::log(&msg);
         daslog = info.detector.clone();
         files.extend(run_files);
     }
 
     eprintln!("Loading {} file(s)…", files.len());
+    logger::log(format!(
+        "Headless: loading {} file(s) from {}",
+        files.len(),
+        files
+            .first()
+            .and_then(|p| p.parent())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    ));
     let last_decile = AtomicUsize::new(0);
     let detector = loader::detect_detector(&files, daslog.as_deref(), cli.detector);
     let stack = loader::load_paths_with_progress(&files, detector, |done, total| {
@@ -369,7 +385,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
             eprintln!("  loaded {done}/{total}");
         }
     })?;
-    eprintln!(
+    let msg = format!(
         "Loaded {} image(s), {}×{} px ({} NaN/Inf pixel(s) zeroed); detector {}: {}.",
         stack.n_frames(),
         stack.width,
@@ -378,6 +394,8 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         stack.detector.summary(),
         stack.orientation
     );
+    eprintln!("{msg}");
+    logger::log(&msg);
 
     // The mask, from the command-line definition and the integrated image.
     let mut spec = MaskSpec {
@@ -401,12 +419,14 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         }
         let m = spec.build(&integrated)?.expect("non-empty spec");
         let n = dehydration_hydration::mask::count(&m);
-        eprintln!(
+        let msg = format!(
             "Mask: {} — {n} of {} pixel(s) selected ({:.1}%).",
             spec.describe(),
             m.len(),
             100.0 * n as f64 / m.len().max(1) as f64
         );
+        eprintln!("{msg}");
+        logger::log(&msg);
         Some(m)
     };
 
@@ -415,17 +435,27 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut progress = |stage: &str, fraction: f32| {
         if stage != last_stage {
             eprintln!("[{:>3.0}%] {stage}", fraction * 100.0);
+            logger::log(format!("[{:>3.0}%] {stage}", fraction * 100.0));
             last_stage = stage.to_owned();
         }
     };
     let mut log = |line: &str| eprintln!("    {line}");
-    eprintln!(
+    let msg = format!(
         "mbirtorch hsnt ({}): {}",
         hsnt_cli::mbirtorch_commit().unwrap_or_else(|| "commit unknown".to_owned()),
         cli.params.summary()
     );
+    eprintln!("{msg}");
+    logger::log(format!(
+        "Headless correction starting — {msg}, bin {}, output {}",
+        cli.bin,
+        cli.output
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    ));
     let out = run_correction(&stack, cli.params, cli.bin, mask.as_ref(), &cancel, &mut progress, &mut log)?;
-    eprintln!(
+    let msg = format!(
         "Correction done in {:.1} s — {}",
         out.elapsed_seconds,
         if out.report.summary_line.is_empty() {
@@ -434,8 +464,11 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
             out.report.summary_line.clone()
         }
     );
+    eprintln!("{msg}");
+    logger::log(&msg);
     for w in &out.report.warnings {
         eprintln!("  warning: {w}");
+        logger::warn(format!("mbirtorch warning: {w}"));
     }
 
     let input_dir = files
@@ -471,6 +504,11 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         &mut |_, _| {},
     )?;
     eprintln!("Exported {} corrected image(s).", out.frames.len());
+    logger::log(format!(
+        "Exported {} corrected image(s) to {}",
+        out.frames.len(),
+        folder.display()
+    ));
     println!("{}", folder.display());
     Ok(())
 }
@@ -482,9 +520,33 @@ fn main() -> eframe::Result<()> {
         // SAFETY: called before any other thread exists (start of main).
         unsafe { std::env::set_var("GTK_USE_PORTAL", "0") };
     }
+    // Shared VENUS log (dehydration_hydration_beta_<user>.log — its own
+    // file, apart from the production tool's), so what a user did and where
+    // it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: dehydration_hydration (beta, mbirtorch hsnt) {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+
     let cli = match parse_args() {
         Ok(cli) => cli,
         Err(e) => {
+            logger::error(format!("Invalid command line: {e}"));
             eprintln!("Error: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
@@ -498,9 +560,11 @@ fn main() -> eframe::Result<()> {
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
+            logger::error(format!("Headless run failed: {e:#}"));
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
+        logger::log("Headless run done; application closed");
         return Ok(());
     }
 
@@ -512,7 +576,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         TITLE,
         native_options,
         Box::new(move |cc| {
@@ -537,5 +601,10 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }

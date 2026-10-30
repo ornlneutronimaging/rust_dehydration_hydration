@@ -8,6 +8,7 @@ description = "Dehydration/hydration denoising of a TIFF image stack with the ma
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
 detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
+chrono = "0.4"
 libc = "0.2"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = "0.35"

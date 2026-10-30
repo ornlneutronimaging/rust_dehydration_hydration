@@ -35,8 +35,10 @@ python -m mbirtorch.hsnt denoise <scratch>/input.h5 -o <scratch>/out \
 
 runs in the pixi environment of the sibling checkout
 **`/SNS/VENUS/shared/software/git/mbirtorch_hsnt`** (clone of
-cabouman/mbirtorch with the remote `harel` = harel55/mbirtorch, **branch
-`hsnt`** checked out; `pixi install -e cuda` → torch 2.14 + CUDA 13, editable
+cabouman/mbirtorch, **`main` checked out** — v0.1.2, which carries the hsnt
+package since its squash on 2026-10-06; the remote `harel` =
+harel55/mbirtorch, where the package was developed on branch `hsnt`, is kept
+for reference; `pixi install -e cuda` → torch 2.14 + CUDA 13, editable
 mbirtorch, so the checked-out branch is what runs). `<stem>_denoised.h5` is
 read back into frames; the dehydrated file (maps + spectra), the JSON report,
 the two PNG plots and the log are kept in memory and written into the export
@@ -59,11 +61,12 @@ leaves a solve holding the GPU's memory. A 512 × 512 × 2786 stack needs about
 28 GB for the compiled full solve on an A100 40 GB; with NeCTAR or another
 correction on the same GPU, pick another `cuda:N` or let the retry stream.
 
-To update the algorithm: `cd mbirtorch_hsnt && git fetch harel && git
-checkout hsnt && git pull` (or check out another branch, e.g. upstream
-`prerelease`, which carries the same package squashed in) — no rebuild of this
-program is needed. The **ℹ mbirtorch** button shows the commit that is
-checked out.
+To update the algorithm: `cd mbirtorch_hsnt && git pull origin main` (or
+check out another branch, e.g. upstream `prerelease`, or `harel/hsnt` for
+work not yet merged) — no rebuild of this program is needed. The
+**ℹ mbirtorch** button shows the commit that is checked out. The hsnt
+package of v0.1.2 (2026-10-09) is the `hsnt` branch at edb0bcb with
+docstring edits only; its command line, solvers and outputs are the same.
 
 ## Workflow (same as the notebook)
 
@@ -178,6 +181,16 @@ cargo test -- --ignored    # + one real run through the mbirtorch environment
 
 The portal entry is **"Dehydration / Hydration Correction (beta, mbirtorch
 hsnt)"** in the Beta category of the unified launcher.
+
+## Log
+
+Every session appends what the user did (files opened, runs located, mask
+and correction parameters, the `mbirtorch.hsnt` command launched and how it
+ended, exports, errors) to the shared VENUS log
+`/SNS/VENUS/shared/log/dehydration_hydration_beta_<user>.log` — its own file,
+apart from the production tool's `dehydration_hydration_<user>.log`. One
+timestamped line per event; the file is readable in the Log Browser
+(`rust_log_browser`), like the logs of the other VENUS tools.
 
 ## Implementation notes
 

@@ -161,7 +161,10 @@ fn image_artifacts(
     };
     match encode() {
         Ok(files) => out.extend(files),
-        Err(e) => log(&format!("[dehydration_hydration] cannot encode the map / mask images: {e:#}")),
+        Err(e) => {
+            log(&format!("[dehydration_hydration] cannot encode the map / mask images: {e:#}"));
+            crate::logger::warn(format!("cannot encode the map / mask images: {e:#}"));
+        }
     }
     out
 }

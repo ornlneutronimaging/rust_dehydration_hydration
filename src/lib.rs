@@ -13,6 +13,7 @@ pub mod correction;
 pub mod export;
 pub mod hsnt_cli;
 pub mod loader;
+pub mod logger;
 pub mod mask;
 pub mod recent;
 pub mod run_lookup;

@@ -1,6 +1,7 @@
 //! The correction engine of the beta: Harel Dor's `mbirtorch.hsnt` package
-//! (branch `hsnt` of harel55/mbirtorch, squashed into cabouman/mbirtorch's
-//! `prerelease` on 2026-10-06), driven through its command line
+//! (developed on branch `hsnt` of harel55/mbirtorch, squashed into
+//! cabouman/mbirtorch on 2026-10-06 and released in v0.1.2 on 2026-10-09;
+//! the checkout tracks upstream `main`), driven through its command line
 //!
 //! ```text
 //! python -m mbirtorch.hsnt denoise <input.h5> -o <dir> [options]
@@ -35,10 +36,11 @@ use std::time::Duration;
 /// matplotlib. Overridden by [`PYTHON_ENV_VAR`].
 pub const DEFAULT_PYTHON: &str =
     "/SNS/VENUS/shared/software/git/mbirtorch_hsnt/.pixi/envs/cuda/bin/python";
-/// The mbirtorch clone the beta runs: branch `hsnt` tracking
-/// `harel` = https://github.com/harel55/mbirtorch (origin = cabouman).
+/// The mbirtorch clone the beta runs: `main` of origin =
+/// https://github.com/cabouman/mbirtorch (v0.1.2 carries the hsnt package;
+/// the remote `harel` = harel55/mbirtorch, where it was developed, is kept).
 pub const MBIRTORCH_CHECKOUT: &str = "/SNS/VENUS/shared/software/git/mbirtorch_hsnt";
-pub const MBIRTORCH_BRANCH: &str = "hsnt (harel55/mbirtorch)";
+pub const MBIRTORCH_BRANCH: &str = "main (cabouman/mbirtorch, v0.1.2)";
 /// Environment variable naming another Python interpreter with mbirtorch.
 pub const PYTHON_ENV_VAR: &str = "DEHY_HSNT_PYTHON";
 /// Environment variable naming the folder the exchange files are written
@@ -931,6 +933,7 @@ fn run_cli(
         params.cli_args().join(" ")
     );
     log(&format!("[dehydration_hydration] $ {cmdline}"));
+    crate::logger::log(format!("mbirtorch hsnt launched: {cmdline}"));
     progress("mbirtorch: starting Python…", 0.16);
     let mut child = cmd
         .spawn()
@@ -992,9 +995,19 @@ fn run_cli(
     let _ = out_reader.join();
     let _ = err_reader.join();
     if killed || cancel.load(Ordering::Relaxed) {
+        crate::logger::warn(format!("mbirtorch hsnt killed on cancel ({status})"));
         bail!("cancelled");
     }
     let failure = (!status.success()).then(|| format!("({status}) {}", failure_summary(&lines)));
+    match &failure {
+        Some(f) => crate::logger::error(format!("mbirtorch hsnt failed {f}")),
+        None => crate::logger::log(format!(
+            "mbirtorch hsnt finished ({status}, {} line(s), {} warning(s)): {}",
+            lines.len(),
+            warnings.len(),
+            if summary_line.is_empty() { "no summary line" } else { summary_line.as_str() }
+        )),
+    }
     Ok(CliRun {
         lines,
         warnings,
@@ -1083,6 +1096,7 @@ pub fn run_denoise(
         // streamed solve needs a fraction of the memory.
         let note = "the device ran out of memory in the full solve — retrying in stream mode";
         log(&format!("[dehydration_hydration] {note}"));
+        crate::logger::warn(note);
         progress("mbirtorch: out of memory — retrying in stream mode…", 0.3);
         let _ = std::fs::remove_dir_all(&out_dir);
         used.mode = SolveMode::Stream;
@@ -1356,9 +1370,9 @@ mod tests {
     fn commit_is_read_from_a_git_folder() {
         let dir = tmp("gitdir");
         std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
-        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/hsnt\n").unwrap();
-        std::fs::write(dir.join(".git/refs/heads/hsnt"), "edb0bcba9988\n").unwrap();
-        assert_eq!(mbirtorch_commit_in(&dir).as_deref(), Some("edb0bcb (hsnt)"));
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".git/refs/heads/main"), "5e23a151310aeede6c72e084308617ee6a73dc28\n").unwrap();
+        assert_eq!(mbirtorch_commit_in(&dir).as_deref(), Some("5e23a15 (main)"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

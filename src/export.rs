@@ -342,7 +342,7 @@ mod tests {
                 reduced_chi2: Some(1.05),
                 ..HsntReport::default()
             },
-            mbirtorch_commit: Some("edb0bcb (hsnt)".to_owned()),
+            mbirtorch_commit: Some("5e23a15 (main)".to_owned()),
             mask: Some(MaskInfo { selected: 10, total: 15, description: "1 include rectangle(s)".to_owned() }),
         }
     }
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(doc["parameters"]["input_type"], "transmission");
         assert_eq!(doc["result"]["rank"], 2);
         assert_eq!(doc["result"]["reduced_chi2"], 1.05);
-        assert_eq!(doc["mbirtorch_commit"], "edb0bcb (hsnt)");
+        assert_eq!(doc["mbirtorch_commit"], "5e23a15 (main)");
         assert_eq!(doc["mask"]["pixels_selected"], 10);
         assert_eq!(doc["input_folder"], "/data/Run_1");
     }
