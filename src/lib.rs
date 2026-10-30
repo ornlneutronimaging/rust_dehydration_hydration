@@ -12,6 +12,7 @@ pub mod correction;
 pub mod export;
 pub mod hsnt;
 pub mod linalg;
+pub mod logger;
 pub mod loader;
 pub mod mask;
 pub mod nmf;

@@ -9,6 +9,7 @@ use crate::correction::{start_correction, CorrectionMsg, CorrectionParams, MATER
 use crate::export::{start_export, ExportMsg, Provenance};
 use crate::hsnt::{estimate_num_materials, DatasetType, MBIRTORCH_COMMIT, MBIRTORCH_VERSION};
 use crate::loader::{self, Detector, ImageStack, Selection};
+use crate::logger;
 use crate::nmf::BetaLoss;
 use crate::run_lookup::{self, RunInfo};
 use crate::spectra;
@@ -578,6 +579,20 @@ impl DehydrationApp {
             ui.label(egui::RichText::new(s.orientation.label()).weak())
                 .on_hover_text(s.detector.detector().description());
         }
+        if changed {
+            logger::log(format!(
+                "Detector set to {}{}",
+                match self.detector_override {
+                    None => "auto".to_owned(),
+                    Some(d) => d.label().to_owned(),
+                },
+                if !self.input_files.is_empty() && self.loading.is_none() {
+                    " — reloading the stack"
+                } else {
+                    ""
+                }
+            ));
+        }
         if changed && !self.input_files.is_empty() && self.loading.is_none() {
             let files = self.input_files.clone();
             let daslog = self.input_daslog.clone();
@@ -601,6 +616,7 @@ impl DehydrationApp {
         }
         if self.corr_job.is_some() || self.export_job.is_some() {
             self.status = "Wait for the running job to finish (or cancel it) first.".to_owned();
+            logger::warn(format!("Load of {} file(s) refused: {}", paths.len(), self.status));
             return false;
         }
         let total = paths.len();
@@ -624,6 +640,19 @@ impl DehydrationApp {
         });
         self.loading = Some(LoadJob { rx, done: 0, total });
         self.status = format!("Loading {total} file(s)…");
+        logger::log(format!(
+            "Loading {total} file(s) from {} (first: {})",
+            self.input_files
+                .first()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            self.input_files
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
         true
     }
 
@@ -644,7 +673,10 @@ impl DehydrationApp {
             self.loading = None;
             match res {
                 Ok(stack) => self.apply_stack(stack),
-                Err(e) => self.status = format!("Load failed: {e:#}"),
+                Err(e) => {
+                    self.status = format!("Load failed: {e:#}");
+                    logger::error(&self.status);
+                }
             }
         }
     }
@@ -703,6 +735,14 @@ impl DehydrationApp {
         self.status = format!(
             "Loaded {n} image(s), {w}×{h} px, {detector}: {orientation}.{spectra_note}"
         );
+        logger::log(format!(
+            "{} Folder: {}",
+            self.status,
+            self.input_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ));
     }
 
     // ----- material estimation ("Auto") --------------------------------------
@@ -741,6 +781,11 @@ impl DehydrationApp {
         });
         self.estimate_job = Some(rx);
         self.status = "Estimating the number of materials…".to_owned();
+        logger::log(format!(
+            "Auto clicked: estimating the number of materials from {ESTIMATE_SAMPLE} sampled \
+             pixel spectra ({})",
+            self.params.dataset_type.label()
+        ));
     }
 
     fn poll_estimation(&mut self) {
@@ -753,6 +798,7 @@ impl DehydrationApp {
                  (×{MATERIALS_FACTOR} → subspace dimension {}).",
                 self.params.to_hsnt().subspace_dimension()
             );
+            logger::log(&self.status);
         }
     }
 
@@ -782,6 +828,18 @@ impl DehydrationApp {
             self.params.beta_loss.label(),
             self.params.max_iter,
         );
+        logger::log(format!(
+            "{} Stack: {} image(s) {}×{} px, safety factor {}, folder {}",
+            self.status,
+            stack.n_frames(),
+            stack.width,
+            stack.height,
+            self.params.safety_factor,
+            self.input_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ));
     }
 
     fn poll_correction(&mut self) {
@@ -811,6 +869,7 @@ impl DehydrationApp {
                     "Correction done in {:.1} s (subspace dimension {}){preview_note}.",
                     out.elapsed_seconds, out.subspace_dimension
                 );
+                logger::log(&self.status);
                 self.result = Some(ResultState {
                     frames: Arc::new(out.frames),
                     integrated_mean: out.integrated_mean,
@@ -840,8 +899,12 @@ impl DehydrationApp {
             }
             Err(e) if e.contains("cancelled") => {
                 self.status = "Correction cancelled.".to_owned();
+                logger::warn(&self.status);
             }
-            Err(e) => self.status = format!("Correction failed: {e}"),
+            Err(e) => {
+                self.status = format!("Correction failed: {e}");
+                logger::error(&self.status);
+            }
         }
     }
 
@@ -853,6 +916,7 @@ impl DehydrationApp {
         if result.is_preview() {
             self.status =
                 "Preview results are binned — run the full correction before exporting.".to_owned();
+            logger::warn(&self.status);
             return;
         }
         let input_dir_name = self
@@ -867,6 +931,7 @@ impl DehydrationApp {
             dialog = dialog.set_directory(parent);
         }
         let Some(output_dir) = dialog.pick_folder() else {
+            logger::log("Export: dialog cancelled");
             return;
         };
         let (h, w) = result.dims();
@@ -881,6 +946,14 @@ impl DehydrationApp {
             elapsed_seconds: result.elapsed_seconds,
             mask: None,
         };
+        logger::log(format!(
+            "Exporting {} corrected image(s) ({}×{} px) to {} (subfolder named after {})",
+            result.frames.len(),
+            w,
+            h,
+            output_dir.display(),
+            input_dir_name
+        ));
         let rx = start_export(
             output_dir,
             input_dir_name,
@@ -911,6 +984,7 @@ impl DehydrationApp {
             dialog = dialog.set_directory(dir);
         }
         let Some(path) = dialog.save_file() else {
+            logger::log("Save CSV: dialog cancelled");
             return;
         };
         // The detector offset is applied to the exported TOF column, so the
@@ -931,8 +1005,20 @@ impl DehydrationApp {
             tof.as_deref(),
             lambda.as_deref(),
         ) {
-            Ok(()) => self.status = format!("Profiles saved to {}", path.display()),
-            Err(e) => self.status = format!("CSV save failed: {e:#}"),
+            Ok(()) => {
+                self.status = format!("Profiles saved to {}", path.display());
+                logger::log(format!(
+                    "{} ({} point(s), region {:?}, offset {} µs)",
+                    self.status,
+                    uncorrected.len(),
+                    self.region.map(|r| [r.left, r.right, r.top, r.bottom]),
+                    self.offset_us
+                ));
+            }
+            Err(e) => {
+                self.status = format!("CSV save failed: {e:#}");
+                logger::error(&self.status);
+            }
         }
     }
 
@@ -954,9 +1040,13 @@ impl DehydrationApp {
         match res {
             Ok(folder) => {
                 self.status = format!("Corrected images exported to {}", folder.display());
+                logger::log(&self.status);
                 self.last_export = Some(folder);
             }
-            Err(e) => self.status = format!("Export failed: {e}"),
+            Err(e) => {
+                self.status = format!("Export failed: {e}");
+                logger::error(&self.status);
+            }
         }
     }
 
@@ -1253,6 +1343,7 @@ impl DehydrationApp {
                             .clicked()
                         {
                             self.selected_ipts = None;
+                            logger::log("IPTS: none (dialogs start in the VENUS root)");
                         }
                         egui::ScrollArea::vertical()
                             .max_height(260.0)
@@ -1272,6 +1363,7 @@ impl DehydrationApp {
                                         .clicked()
                                     {
                                         self.selected_ipts = Some(n);
+                                        logger::log(format!("IPTS-{n} selected"));
                                     }
                                 }
                                 if !any {
@@ -1298,7 +1390,10 @@ impl DehydrationApp {
             .set_directory(self.dialog_start_dir())
             .pick_files()
         {
+            logger::log(format!("Open Files: {} file(s) picked", files.len()));
             self.start_load(files, ctx);
+        } else {
+            logger::log("Open Files: dialog cancelled");
         }
     }
 
@@ -1324,9 +1419,13 @@ impl DehydrationApp {
                 .on_disabled_hover_text(format!("{} no longer exists", dir.display()))
                 .clicked()
             {
+                logger::log(format!("Recent: picked {}", dir.display()));
                 match loader::list_supported_in_dir(&dir) {
                     Ok(files) => self.start_load(files, ctx),
-                    Err(e) => self.status = format!("{e:#}"),
+                    Err(e) => {
+                        self.status = format!("{e:#}");
+                        logger::error(&self.status);
+                    }
                 }
                 ui.close();
             }
@@ -1339,10 +1438,16 @@ impl DehydrationApp {
             .set_directory(self.dialog_start_dir())
             .pick_folder()
         {
+            logger::log(format!("Open Folder: {}", dir.display()));
             match loader::list_supported_in_dir(&dir) {
                 Ok(files) => self.start_load(files, ctx),
-                Err(e) => self.status = format!("{e:#}"),
+                Err(e) => {
+                    self.status = format!("{e:#}");
+                    logger::error(&self.status);
+                }
             }
+        } else {
+            logger::log("Open Folder: dialog cancelled");
         }
     }
 
@@ -1381,8 +1486,19 @@ impl DehydrationApp {
         if dropped.is_empty() {
             return;
         }
+        logger::log(format!(
+            "Dropped {} item(s) onto the window: {}",
+            dropped.len(),
+            dropped
+                .iter()
+                .take(5)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         if self.loading.is_some() || self.corr_job.is_some() || self.export_job.is_some() {
             self.status = "Wait for the running job to finish (or cancel it) first.".to_owned();
+            logger::warn(format!("Drop ignored: {}", self.status));
             return;
         }
         let mut folders: Vec<PathBuf> = Vec::new();
@@ -1435,6 +1551,7 @@ impl DehydrationApp {
         }
         if !notes.is_empty() {
             let notes = notes.join("; ");
+            logger::warn(format!("Drop: {notes}"));
             // Keep the "Loading…" message when a load did start.
             if self.loading.is_some() {
                 self.status = format!("{} ({notes})", self.status);
@@ -1464,6 +1581,7 @@ impl DehydrationApp {
         self.run_lookup.input = run.to_string();
         self.run_lookup.open = true;
         self.status = format!("Locating run {run}…");
+        logger::log(&self.status);
     }
 
     /// Collect a finished lookup: a non-Timepix run loads its raw data right
@@ -1487,6 +1605,7 @@ impl DehydrationApp {
                         info.ipts,
                         info.detector_text()
                     );
+                    logger::log(&self.status);
                     self.run_lookup.state = RunState::Found(info);
                     self.run_lookup.open = true;
                 }
@@ -1494,6 +1613,7 @@ impl DehydrationApp {
                 Some(Err(e)) => {
                     let error = format!("{e:#}");
                     self.status = format!("Run {run}: {error}");
+                    logger::error(&self.status);
                     self.run_lookup.state = RunState::Failed { run, error };
                 }
             }
@@ -1541,6 +1661,7 @@ impl DehydrationApp {
                     looked_in.display()
                 );
                 self.status = format!("{head}: {error}");
+                logger::error(&self.status);
                 self.run_lookup.state = RunState::Failed { run, error };
                 self.run_lookup.open = true;
                 return;
@@ -1548,6 +1669,7 @@ impl DehydrationApp {
             Err(e) => {
                 let error = format!("{e:#}");
                 self.status = format!("{head}: {error}");
+                logger::error(&self.status);
                 self.run_lookup.state = RunState::Failed { run, error };
                 self.run_lookup.open = true;
                 return;
@@ -1556,6 +1678,7 @@ impl DehydrationApp {
         let n = files.len();
         if self.start_load_from(files, info.detector.clone(), ctx) {
             self.status = format!("{head}: loading {which} data ({n} file(s))…");
+            logger::log(&self.status);
         }
         self.run_lookup.state = RunState::Idle;
         self.run_lookup.open = false;
@@ -1709,6 +1832,7 @@ impl DehydrationApp {
                 }
             });
         if let Some(err) = parse_error {
+            logger::warn(format!("Run dialog: {err}"));
             self.run_lookup.state = RunState::Failed { run: 0, error: err };
         }
         if let Some(run) = lookup {
@@ -1783,10 +1907,19 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.save_file() else { return };
+        let Some(path) = dialog.save_file() else {
+            logger::log("Save settings: dialog cancelled");
+            return;
+        };
         match crate::config::save(&path, &self.current_config()) {
-            Ok(()) => self.status = format!("Settings saved to {}", path.display()),
-            Err(e) => self.status = format!("Saving the config failed: {e:#}"),
+            Ok(()) => {
+                self.status = format!("Settings saved to {}", path.display());
+                logger::log(&self.status);
+            }
+            Err(e) => {
+                self.status = format!("Saving the config failed: {e:#}");
+                logger::error(&self.status);
+            }
         }
     }
 
@@ -1797,13 +1930,28 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.pick_file() else { return };
+        let Some(path) = dialog.pick_file() else {
+            logger::log("Load settings: dialog cancelled");
+            return;
+        };
         match crate::config::load(&path) {
             Ok(cfg) => {
                 self.apply_config(cfg);
                 self.status = format!("Settings loaded from {}", path.display());
+                logger::log(format!(
+                    "{} ({}, {} materials, safety factor {}, {}, {} iterations max)",
+                    self.status,
+                    self.params.dataset_type.label(),
+                    self.params.num_materials,
+                    self.params.safety_factor,
+                    self.params.beta_loss.label(),
+                    self.params.max_iter
+                ));
             }
-            Err(e) => self.status = format!("Loading the config failed: {e:#}"),
+            Err(e) => {
+                self.status = format!("Loading the config failed: {e:#}");
+                logger::error(&self.status);
+            }
         }
     }
 
@@ -2054,7 +2202,12 @@ impl DehydrationApp {
                 .selected_text(self.params.dataset_type.label())
                 .show_ui(ui, |ui| {
                     for t in [DatasetType::Attenuation, DatasetType::Transmission] {
-                        ui.selectable_value(&mut self.params.dataset_type, t, t.label());
+                        if ui
+                            .selectable_value(&mut self.params.dataset_type, t, t.label())
+                            .changed()
+                        {
+                            logger::log(format!("Dataset type set to {}", t.label()));
+                        }
                     }
                 });
             ui.label("attenuation = −log(transmission)")
@@ -2110,7 +2263,12 @@ impl DehydrationApp {
                 .selected_text(self.params.beta_loss.label())
                 .show_ui(ui, |ui| {
                     for b in [BetaLoss::Frobenius, BetaLoss::KullbackLeibler] {
-                        ui.selectable_value(&mut self.params.beta_loss, b, b.label());
+                        if ui
+                            .selectable_value(&mut self.params.beta_loss, b, b.label())
+                            .changed()
+                        {
+                            logger::log(format!("Beta loss set to {}", b.label()));
+                        }
                     }
                 });
 
@@ -2127,6 +2285,7 @@ impl DehydrationApp {
                     .text(job.stage.clone()),
             );
             if ui.button("✖ Cancel").clicked() {
+                logger::log(format!("✖ Cancel clicked (correction at {:.0}%, {})", job.fraction * 100.0, job.stage));
                 job.cancel.store(true, Ordering::Relaxed);
             }
         } else {
@@ -2139,6 +2298,7 @@ impl DehydrationApp {
                     )
                     .clicked()
                 {
+                    logger::log("▶ Perform correction clicked");
                     self.start_correction_job(&ctx, 1);
                 }
                 if ui
@@ -2150,6 +2310,7 @@ impl DehydrationApp {
                     ))
                     .clicked()
                 {
+                    logger::log("⚡ Preview clicked");
                     self.start_correction_job(&ctx, PREVIEW_BIN);
                 }
             });
@@ -2684,6 +2845,10 @@ impl DehydrationApp {
                     } else {
                         Some(new)
                     };
+                    match self.pixel_marker {
+                        Some((py, px)) => logger::log(format!("Pixel marker set at ({px}, {py})")),
+                        None => logger::log("Pixel marker cleared"),
+                    }
                     self.profiles_dirty = true;
                 }
             }
@@ -2789,6 +2954,12 @@ impl DehydrationApp {
             }
             if response.drag_stopped() {
                 self.region_drag = None;
+                if let Some(r) = self.region {
+                    logger::log(format!(
+                        "Profile region set to rows {}:{}, columns {}:{}",
+                        r.top, r.bottom, r.left, r.right
+                    ));
+                }
             }
         }
 

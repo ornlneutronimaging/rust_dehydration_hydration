@@ -127,6 +127,14 @@ cargo build --release
 cargo test    # algorithm + IO unit tests, no display needed
 ```
 
+## Log
+
+Every session appends what the user did (files opened, runs located,
+correction parameters, exports, errors) to the shared VENUS log
+`/SNS/VENUS/shared/log/dehydration_hydration_<user>.log`, one timestamped
+line per event. The file is readable in the Log Browser
+(`rust_log_browser`), like the logs of the other VENUS tools.
+
 ## Implementation notes
 
 - The NMF (NNDSVD initialization, coordinate-descent solver for the

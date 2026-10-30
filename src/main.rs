@@ -11,6 +11,7 @@ use dehydration_hydration::correction::{run_correction, CorrectionParams, MATERI
 use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt::DatasetType;
 use dehydration_hydration::loader;
+use dehydration_hydration::logger;
 use dehydration_hydration::mask;
 use dehydration_hydration::nmf::BetaLoss;
 use dehydration_hydration::run_lookup;
@@ -122,6 +123,7 @@ fn parse_args() -> Result<Cli, String> {
         };
         match a.as_str() {
             "-h" | "--help" => {
+                logger::log("--help requested, exiting");
                 println!("{USAGE}");
                 std::process::exit(0);
             }
@@ -230,6 +232,7 @@ fn expand_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
             match loader::list_supported_in_dir(input) {
                 Ok(found) => files.extend(found),
                 Err(e) => {
+                    logger::error(format!("Input folder {}: {e:#}", input.display()));
                     eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
@@ -250,9 +253,10 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut daslog: Option<String> = None;
     if let Some(run) = cli.run_number {
         eprintln!("Locating run {run}…");
+        logger::log(format!("Headless: locating run {run}…"));
         let info = run_lookup::resolve(run)?;
         let (run_files, which) = info.default_files()?;
-        eprintln!(
+        let msg = format!(
             "Run {run}: {}, {} — {which} data, {} file(s) in {}",
             info.ipts,
             info.detector_text(),
@@ -263,11 +267,22 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         );
+        eprintln!("{msg}");
+        logger::log(&msg);
         daslog = info.detector.clone();
         files.extend(run_files);
     }
 
     eprintln!("Loading {} file(s)…", files.len());
+    logger::log(format!(
+        "Headless: loading {} file(s) from {}",
+        files.len(),
+        files
+            .first()
+            .and_then(|p| p.parent())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    ));
     let last_decile = AtomicUsize::new(0);
     let detector = loader::detect_detector(&files, daslog.as_deref(), cli.detector);
     let stack = loader::load_paths_with_progress(&files, detector, |done, total| {
@@ -276,7 +291,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
             eprintln!("  loaded {done}/{total}");
         }
     })?;
-    eprintln!(
+    let msg = format!(
         "Loaded {} image(s), {}×{} px ({} NaN/Inf pixel(s) zeroed); detector {}: {}.",
         stack.n_frames(),
         stack.width,
@@ -285,33 +300,51 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         stack.detector.summary(),
         stack.orientation
     );
+    eprintln!("{msg}");
+    logger::log(&msg);
 
     let cancel = AtomicBool::new(false);
     let mut last_stage = String::new();
     let mut progress = |stage: &str, fraction: f32| {
         if stage != last_stage {
             eprintln!("[{:>3.0}%] {stage}", fraction * 100.0);
+            logger::log(format!("[{:>3.0}%] {stage}", fraction * 100.0));
             last_stage = stage.to_owned();
         }
     };
-    eprintln!(
+    let msg = format!(
         "Number of materials: {} (×{} → {} passed to the correction, safety factor {}).",
         cli.params.num_materials,
         MATERIALS_FACTOR,
         cli.params.num_materials * MATERIALS_FACTOR,
         cli.params.safety_factor
     );
+    eprintln!("{msg}");
+    logger::log(&msg);
+    logger::log(format!(
+        "Headless correction starting: {}, {}, {} iterations max, bin {}, output {}",
+        cli.params.dataset_type.label(),
+        cli.params.beta_loss.label(),
+        cli.params.max_iter,
+        cli.bin,
+        cli.output
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    ));
     // The mask, read with the stack's detector orientation so it lines up.
     let mask = match &cli.mask_file {
         Some(path) => {
             let m = mask::load_file(path, stack.detector)?;
             let n = mask::count(&m);
-            eprintln!(
+            let msg = format!(
                 "Mask {}: {n} of {} pixel(s) selected ({:.1}%); the others keep their input values.",
                 path.display(),
                 m.len(),
                 100.0 * n as f64 / m.len().max(1) as f64
             );
+            eprintln!("{msg}");
+            logger::log(&msg);
             Some((path.clone(), m))
         }
         None => None,
@@ -324,10 +357,12 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         &cancel,
         &mut progress,
     )?;
-    eprintln!(
+    let msg = format!(
         "Correction done in {:.1} s (subspace dimension {}, {} pixel(s) corrected).",
         out.elapsed_seconds, out.subspace_dimension, out.pixels_corrected
     );
+    eprintln!("{msg}");
+    logger::log(&msg);
 
     let input_dir = files
         .first()
@@ -360,6 +395,11 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
         &mut |_, _| {},
     )?;
     eprintln!("Exported {} corrected image(s).", out.frames.len());
+    logger::log(format!(
+        "Exported {} corrected image(s) to {}",
+        out.frames.len(),
+        folder.display()
+    ));
     println!("{}", folder.display());
     Ok(())
 }
@@ -371,9 +411,32 @@ fn main() -> eframe::Result<()> {
         // SAFETY: called before any other thread exists (start of main).
         unsafe { std::env::set_var("GTK_USE_PORTAL", "0") };
     }
+    // Shared VENUS log (dehydration_hydration_<user>.log), so what a user did
+    // and where it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: dehydration_hydration {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+
     let cli = match parse_args() {
         Ok(cli) => cli,
         Err(e) => {
+            logger::error(format!("Invalid command line: {e}"));
             eprintln!("Error: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
@@ -386,12 +449,15 @@ fn main() -> eframe::Result<()> {
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
+            logger::error(format!("Headless run failed: {e:#}"));
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
+        logger::log("Headless run done; application closed");
         return Ok(());
     }
     if cli.mask_file.is_some() {
+        logger::warn("--mask only applies to headless runs (--run); the window corrects the whole stack");
         eprintln!("Warning: --mask only applies to headless runs (--run); the window corrects the whole stack.");
     }
 
@@ -402,7 +468,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "VENUS Dehydration / Hydration Correction",
         native_options,
         Box::new(move |cc| {
@@ -424,5 +490,10 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }
