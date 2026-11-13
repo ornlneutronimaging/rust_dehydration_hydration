@@ -1,4 +1,4 @@
-//! Dehydration/Hydration correction library (beta, mbirtorch hsnt): stack
+//! Dehydration/Hydration correction library (mbirtorch hsnt): stack
 //! loading, the hand-off to the maximum-likelihood dehydrate/rehydrate
 //! factorization of `mbirtorch.hsnt` (Harel Dor's `hsnt` branch, run as a
 //! Python subprocess in its own pixi environment), and TIFF export.
@@ -19,4 +19,5 @@ pub mod recent;
 pub mod run_lookup;
 pub mod spectra;
 pub mod theme;
+pub mod variant;
 pub mod zoom;

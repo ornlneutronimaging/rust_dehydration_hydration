@@ -1,4 +1,4 @@
-//! Dehydration/Hydration Correction — beta on mbirtorch's `hsnt` package:
+//! Dehydration/Hydration Correction on mbirtorch's `hsnt` package:
 //! load a stack of TIFF images, denoise it with the maximum-likelihood
 //! dehydrate/rehydrate factorization of `mbirtorch.hsnt` (Harel Dor's `hsnt`
 //! branch, run as a Python subprocess in its own pixi environment), inspect
@@ -16,11 +16,12 @@ use dehydration_hydration::loader;
 use dehydration_hydration::logger;
 use dehydration_hydration::mask::{MaskRect, MaskSpec, RectMode};
 use dehydration_hydration::run_lookup;
+use dehydration_hydration::variant;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 const USAGE: &str = "\
-dehydration_hydration (beta, mbirtorch hsnt) — dehydration/hydration denoising of a TIFF stack
+dehydration_hydration (mbirtorch hsnt) — dehydration/hydration denoising of a TIFF stack
 
 USAGE:
   dehydration_hydration [OPTIONS] [INPUT ...]
@@ -274,8 +275,8 @@ fn parse_args() -> Result<Cli, String> {
             }
             "--beta-loss" | "--beta_loss" | "--safety-factor" | "--safety_factor" => {
                 let v = value(&a)?;
-                logger::warn(format!("{a} {v} is an option of the production NMF tool; the beta ignores it"));
-                eprintln!("Warning: {a} {v} is an option of the production NMF tool; the beta ignores it.");
+                logger::warn(format!("{a} {v} is an option of the former NMF tool; it is ignored"));
+                eprintln!("Warning: {a} {v} is an option of the former NMF tool; it is ignored.");
             }
             "--bin" => {
                 cli.bin = value("--bin")?
@@ -520,15 +521,16 @@ fn main() -> eframe::Result<()> {
         // SAFETY: called before any other thread exists (start of main).
         unsafe { std::env::set_var("GTK_USE_PORTAL", "0") };
     }
-    // Shared VENUS log (dehydration_hydration_beta_<user>.log — its own
-    // file, apart from the production tool's), so what a user did and where
+    // Shared VENUS log (dehydration_hydration_<user>.log; the beta build
+    // has its own dehydration_hydration_beta_<user>.log), so what a user did and where
     // it failed can be read back in the log browser.
     if let Err(e) = logger::init() {
         eprintln!("Warning: logging disabled — {e}");
     }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     logger::log(format!(
-        "Command line: dehydration_hydration (beta, mbirtorch hsnt) {}",
+        "Command line: dehydration_hydration ({}) {}",
+        variant::label(),
         if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
     ));
     if let Ok(cwd) = std::env::current_dir() {
@@ -568,16 +570,17 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    const TITLE: &str = "VENUS Dehydration / Hydration Correction (beta — mbirtorch hsnt)";
+    let title = format!("VENUS Dehydration / Hydration Correction ({})", variant::label());
+    let title = title.as_str();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_title(TITLE),
+            .with_title(title),
         ..Default::default()
     };
 
     let result = eframe::run_native(
-        TITLE,
+        title,
         native_options,
         Box::new(move |cc| {
             // Saved light/dark preference, shared by all the VENUS rust

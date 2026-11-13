@@ -572,16 +572,16 @@ impl DehydrationApp {
         }
         let modal = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
             ui.set_max_width(520.0);
-            ui.heading("Dehydration / Hydration Correction — beta (mbirtorch hsnt)");
+            ui.heading(format!("Dehydration / Hydration Correction ({})", crate::variant::label()));
             ui.label(format!("Application version {}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             ui.add_space(4.0);
             ui.label(
-                "This beta runs the new dehydration/hydration of mbirtorch's hsnt package \
+                "This tool runs the dehydration/hydration of mbirtorch's hsnt package \
                  (Harel Dor): the maximum-likelihood factorization X = W·H of the \
                  attenuation under the Poisson statistics of the counts, with the number \
                  of components estimated by likelihood-ratio tests when it is not given. \
-                 The production tool runs a native port of the earlier least-squares NMF.",
+                 It replaces the native port of the earlier least-squares NMF.",
             );
             ui.add_space(6.0);
             ui.label(
@@ -2547,7 +2547,7 @@ impl DehydrationApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("ℹ mbirtorch")
-                    .on_hover_text("Algorithm provenance — the mbirtorch hsnt branch this beta runs")
+                    .on_hover_text("Algorithm provenance — the mbirtorch hsnt checkout this tool runs")
                     .clicked()
                 {
                     self.show_about = true;

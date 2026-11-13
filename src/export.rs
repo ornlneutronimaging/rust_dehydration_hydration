@@ -157,7 +157,7 @@ pub fn provenance_json(p: &Provenance) -> String {
     let doc = serde_json::json!({
         "tool": "rust_dehydration_hydration",
         "tool_version": env!("CARGO_PKG_VERSION"),
-        "tool_variant": "beta — mbirtorch hsnt",
+        "tool_variant": crate::variant::label(),
         "algorithm": "mbirtorch.hsnt denoise: maximum-likelihood (Poisson) factorization X = W·H of the attenuation, dehydrate + rehydrate",
         "mbirtorch_checkout": crate::hsnt_cli::MBIRTORCH_CHECKOUT,
         "mbirtorch_branch": crate::hsnt_cli::MBIRTORCH_BRANCH,

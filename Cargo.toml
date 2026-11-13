@@ -2,7 +2,7 @@
 name = "dehydration_hydration"
 version = "0.2.0"
 edition = "2024"
-description = "Dehydration/hydration denoising of a TIFF image stack with the maximum-likelihood hsnt factorization of mbirtorch (beta: drives Harel Dor's mbirtorch.hsnt command line)"
+description = "Dehydration/hydration denoising of a TIFF image stack with the maximum-likelihood hsnt factorization of mbirtorch (drives Harel Dor's mbirtorch.hsnt command line)"
 
 [dependencies]
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).

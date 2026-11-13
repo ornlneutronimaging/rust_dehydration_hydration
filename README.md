@@ -1,15 +1,25 @@
-# Dehydration / Hydration Correction — beta (mbirtorch hsnt)
+# Dehydration / Hydration Correction (mbirtorch hsnt)
 
-**This is the beta checkout** (`rust_dehydration_hydration_development`,
-branch `mbirtorch_hsnt`) of the VENUS dehydration/hydration tool. It keeps the
-production GUI (load a stack, compare corrected vs raw, profiles, export) but
-replaces the correction engine: instead of the native Rust port of the
-earlier least-squares NMF `hyper_denoise`, it runs the **new
-dehydration/hydration of mbirtorch's `hsnt` package by Harel Dor** — the
+The VENUS dehydration/hydration tool (load a stack, compare corrected vs raw,
+profiles, export). The correction is the **dehydration/hydration of
+mbirtorch's `hsnt` package by Harel Dor** — the
 maximum-likelihood factorization X = W·H of the attenuation under the Poisson
 statistics of the counts, with the number of components estimated by
-likelihood-ratio tests when it is not given. The production tool is
-`../rust_dehydration_hydration` and is not affected.
+likelihood-ratio tests when it is not given. It replaced the native Rust port
+of the earlier least-squares NMF `hyper_denoise` (last commit of that tool:
+`81579bd`).
+
+**Production and beta.** The same repository is checked out twice:
+
+| Checkout | Branch | Portal entry | Log file |
+|---|---|---|---|
+| `rust_dehydration_hydration` | `main` | Dehydration / Hydration Correction | `dehydration_hydration_<user>.log` |
+| `rust_dehydration_hydration_development` | `mbirtorch_hsnt` | Dehydration / Hydration Correction (beta), Beta category | `dehydration_hydration_beta_<user>.log` |
+
+New work goes into the beta checkout and reaches production by merging its
+branch into `main`. A binary built in the `_development` checkout labels
+itself "beta" (window title, About, provenance, log file) — see
+`src/variant.rs`; the sources are otherwise the same.
 
 Algorithm reference: M. S. N. Chowdhury, D. Yang, S. Tang,
 S. V. Venkatakrishnan, H. Z. Bilheux, G. T. Buzzard, and C. A. Bouman,
@@ -122,7 +132,7 @@ docstring edits only; its command line, solvers and outputs are the same.
    residual when no dose was given), the CLI's warnings. **📈 Diagnostics**
    shows the component spectra and maps plots, the data checks and the
    memory plan.
-7. **Corrected vs raw** and **Profiles** views — unchanged from production
+7. **Corrected vs raw** and **Profiles** views
    (shared contrast, difference pane, region + single-pixel profiles,
    TOF / wavelength axes from `*_Spectra.txt`, detector offset, CSV export).
    The profile series have fixed colors — uncorrected orange ✕, corrected
@@ -140,7 +150,7 @@ docstring edits only; its command line, solvers and outputs are the same.
 **⚙ Config** saves / loads the settings as an HDF5 file (format version 2:
 `/correction` holds `input_type`, `rank`, `max_rank`, `spectra`, `dose`,
 `device`, `mode`, `max_steps`, `rel_tol`, `max_passes`, `compile`). A
-version-1 file of the production tool still loads: its `dataset_type`
+version-1 file of the former NMF tool still loads: its `dataset_type`
 becomes the input type and its `num_materials` the (fixed) rank.
 
 ## Headless batch mode
@@ -158,7 +168,7 @@ relayed on stderr, indented; the created folder is printed on stdout).
 `--mask-include x0,y0,x1,y1` / `--mask-exclude x0,y0,x1,y1` (repeatable,
 half-open pixel bounds in the oriented frame) and `--mask-range LO:HI` on
 the integrated image. For scripts written against the
-production tool, `--materials N` works unchanged (`--rank` is the hsnt
+former NMF tool, `--materials N` works unchanged (`--rank` is the hsnt
 synonym), `--dataset-type` means
 `--input-type`, `--max-iter` means `--max-steps`, and `--beta-loss` /
 `--safety-factor` are accepted and ignored with a warning — so the Workflow
@@ -179,16 +189,17 @@ cargo test                 # IO / parsing unit tests, no Python needed
 cargo test -- --ignored    # + one real run through the mbirtorch environment
 ```
 
-The portal entry is **"Dehydration / Hydration Correction (beta, mbirtorch
-hsnt)"** in the Beta category of the unified launcher.
+The portal entries are **"Dehydration / Hydration Correction"** (production)
+and **"Dehydration / Hydration Correction (beta)"** in the Beta category of
+the unified launcher.
 
 ## Log
 
 Every session appends what the user did (files opened, runs located, mask
 and correction parameters, the `mbirtorch.hsnt` command launched and how it
 ended, exports, errors) to the shared VENUS log
-`/SNS/VENUS/shared/log/dehydration_hydration_beta_<user>.log` — its own file,
-apart from the production tool's `dehydration_hydration_<user>.log`. One
+`/SNS/VENUS/shared/log/dehydration_hydration_<user>.log` (the beta build:
+`dehydration_hydration_beta_<user>.log`, its own file). One
 timestamped line per event; the file is readable in the Log Browser
 (`rust_log_browser`), like the logs of the other VENUS tools.
 
@@ -207,8 +218,8 @@ timestamped line per event; the file is readable in the Log Browser
   `Done` messages to the app.
 - `src/export.rs`: provenance JSON (serde_json) + the artifacts;
   `src/config.rs`: format version 2 with version-1 fallback.
-- The native NMF modules of production (`hsnt.rs`, `nmf.rs`, `linalg.rs`,
-  `examples/cross_check.rs`) are gone from this branch.
+- The native NMF modules of the former tool (`hsnt.rs`, `nmf.rs`,
+  `linalg.rs`, `examples/cross_check.rs`) are gone.
 - TIFF frames are oriented on load per detector (shared
   `rust_detector_orientation` crate) and written back in the on-disk
   orientation on export; the orientation is irrelevant to the algorithm

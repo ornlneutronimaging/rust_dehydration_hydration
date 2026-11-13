@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Launch the Dehydration/Hydration Correction GUI — BETA on mbirtorch hsnt
-# (see README.md), rebuilding first if the
-# sources changed.
+# Launch the Dehydration/Hydration Correction GUI (mbirtorch hsnt, see
+# README.md), rebuilding first if the sources changed. The same script serves
+# production (rust_dehydration_hydration) and the beta (…_development).
 #
 # Usage: ./launch_dehydration_hydration.sh [dehydration_hydration arguments...]
 #   e.g. ./launch_dehydration_hydration.sh /SNS/VENUS/IPTS-XXXX/.../Run_YYYY

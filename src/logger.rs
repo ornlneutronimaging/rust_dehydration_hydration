@@ -1,5 +1,6 @@
 //! Append-only application log in the shared VENUS log directory
-//! (`/SNS/VENUS/shared/log/dehydration_hydration_beta_<user>.log`), following the
+//! (`/SNS/VENUS/shared/log/dehydration_hydration_<user>.log`, or
+//! `dehydration_hydration_beta_<user>.log` for the beta build), following the
 //! `<tool>_<user>.log` naming and Python-logging line format
 //! (`2026-07-20 09:47:14,967 - INFO - message`) used by the other imaging
 //! tools that log there, so the log browser picks it up.
@@ -29,9 +30,10 @@ pub fn hostname() -> String {
         .unwrap_or_else(|_| "unknown host".to_owned())
 }
 
-/// `/SNS/VENUS/shared/log/dehydration_hydration_beta_<user>.log`
+/// `/SNS/VENUS/shared/log/dehydration_hydration_<user>.log`; the beta build
+/// (see `variant`) logs to `dehydration_hydration_beta_<user>.log`.
 pub fn log_path() -> PathBuf {
-    PathBuf::from(LOG_DIR).join(format!("dehydration_hydration_beta_{}.log", user_id()))
+    PathBuf::from(LOG_DIR).join(format!("{}_{}.log", crate::variant::log_stem(), user_id()))
 }
 
 /// Open (append) the log file and write the session-start line. Call once at
