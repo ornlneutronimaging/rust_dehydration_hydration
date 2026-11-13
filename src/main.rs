@@ -14,7 +14,7 @@ use dehydration_hydration::hsnt_cli::{self, Compile, Device, InputType, Rank, So
 use dehydration_hydration::export::MaskInfo;
 use dehydration_hydration::loader;
 use dehydration_hydration::logger;
-use dehydration_hydration::mask::{MaskRect, MaskSpec, RectMode};
+use dehydration_hydration::mask::{MaskRect, MaskShape, MaskSpec, RectMode};
 use dehydration_hydration::run_lookup;
 use dehydration_hydration::variant;
 use std::path::PathBuf;
@@ -90,9 +90,17 @@ OPTIONS:
                            with the stack's detector orientation
   --mask-include <x0,y0,x1,y1>
                            Keep only the pixels inside this rectangle
-                           (half-open pixel bounds; repeatable: inside any)
+                           (half-open pixel bounds). The include options are
+                           repeatable and combine: inside any of the shapes
+  --mask-include-ellipse <cx,cy,rx,ry>
+                           … inside this ellipse (center and radii, pixels)
+  --mask-include-polygon <x0,y0,x1,y1,x2,y2,…>
+                           … inside this polygon (3 or more vertices)
   --mask-exclude <x0,y0,x1,y1>
-                           Drop the pixels inside this rectangle (repeatable)
+  --mask-exclude-ellipse <cx,cy,rx,ry>
+  --mask-exclude-polygon <x0,y0,x1,y1,x2,y2,…>
+                           Drop the pixels inside this rectangle / ellipse /
+                           polygon (repeatable)
   --mask-range <LO:HI>     Keep the pixels whose integrated (summed) value
                            lies in [LO, HI]
 
@@ -142,7 +150,7 @@ struct Cli {
     ipts: Option<u32>,
     /// `--mask*`: the pixel mask definition (file loaded after the stack).
     mask_file: Option<PathBuf>,
-    mask_rects: Vec<MaskRect>,
+    mask_shapes: Vec<MaskShape>,
     mask_range: Option<(f32, f32)>,
 }
 
@@ -158,7 +166,7 @@ fn parse_args() -> Result<Cli, String> {
         run_number: None,
         ipts: None,
         mask_file: None,
-        mask_rects: Vec::new(),
+        mask_shapes: Vec::new(),
         mask_range: None,
     };
     let mut args = std::env::args().skip(1);
@@ -260,8 +268,28 @@ fn parse_args() -> Result<Cli, String> {
             "--mask-include" | "--mask_include" | "--mask-exclude" | "--mask_exclude" => {
                 let v = value(&a)?;
                 let mode = if a.contains("include") { RectMode::Include } else { RectMode::Exclude };
-                cli.mask_rects.push(MaskRect::parse(&v, mode).ok_or_else(|| {
-                    format!("invalid {a} '{v}': expected x0,y0,x1,y1 with x1 > x0 and y1 > y0")
+                cli.mask_shapes.push(
+                    MaskRect::parse(&v, mode)
+                        .ok_or_else(|| {
+                            format!("invalid {a} '{v}': expected x0,y0,x1,y1 with x1 > x0 and y1 > y0")
+                        })?
+                        .into(),
+                );
+            }
+            "--mask-include-ellipse" | "--mask_include_ellipse" | "--mask-exclude-ellipse"
+            | "--mask_exclude_ellipse" => {
+                let v = value(&a)?;
+                let mode = if a.contains("include") { RectMode::Include } else { RectMode::Exclude };
+                cli.mask_shapes.push(MaskShape::parse_ellipse(&v, mode).ok_or_else(|| {
+                    format!("invalid {a} '{v}': expected cx,cy,rx,ry with rx > 0 and ry > 0")
+                })?);
+            }
+            "--mask-include-polygon" | "--mask_include_polygon" | "--mask-exclude-polygon"
+            | "--mask_exclude_polygon" => {
+                let v = value(&a)?;
+                let mode = if a.contains("include") { RectMode::Include } else { RectMode::Exclude };
+                cli.mask_shapes.push(MaskShape::parse_polygon(&v, mode).ok_or_else(|| {
+                    format!("invalid {a} '{v}': expected x0,y0,x1,y1,x2,y2,… (at least 3 points)")
                 })?);
             }
             "--mask-range" | "--mask_range" => {
@@ -400,7 +428,7 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
 
     // The mask, from the command-line definition and the integrated image.
     let mut spec = MaskSpec {
-        rects: cli.mask_rects.clone(),
+        shapes: cli.mask_shapes.clone(),
         range: cli.mask_range,
         file: None,
     };

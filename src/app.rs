@@ -11,7 +11,7 @@ use crate::export::{start_export, ExportMsg, MaskInfo, Provenance};
 use crate::hsnt_cli::{self, Artifact, Compile, Device, HsntReport, InputType, Rank, SolveMode, Spectra};
 use crate::loader::{self, Detector, ImageStack, Selection};
 use crate::logger;
-use crate::mask::{self, MaskFile, MaskRect, MaskSpec, RectMode};
+use crate::mask::{self, Geom, MaskFile, MaskShape, MaskSpec, RectMode, BOX_HANDLES};
 use crate::run_lookup::{self, RunInfo};
 use crate::spectra;
 
@@ -83,6 +83,96 @@ enum View {
     Raw,
     Result,
     Profiles,
+}
+
+/// The steps of the workflow, in order: the step bar at the top of the
+/// window shows them, the left panel holds the controls of the current one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Data,
+    Mask,
+    Correct,
+    Review,
+    Export,
+}
+
+impl Step {
+    const ALL: [Step; 5] = [Step::Data, Step::Mask, Step::Correct, Step::Review, Step::Export];
+
+    fn index(self) -> usize {
+        Step::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Step::Data => "Load data",
+            Step::Mask => "Mask",
+            Step::Correct => "Correct",
+            Step::Review => "Review",
+            Step::Export => "Export",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Step::Data => "Choose the stack of images to correct",
+            Step::Mask => "Optional: restrict the correction to part of the image",
+            Step::Correct => "Set the parameters and run the correction",
+            Step::Review => "Compare the corrected stack with the raw one",
+            Step::Export => "Write the corrected stack to disk",
+        }
+    }
+}
+
+/// What a press on the integrated image does in the Mask step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MaskTool {
+    /// Select a shape, move it, reshape it by its handles.
+    Edit,
+    Rect,
+    Ellipse,
+    Polygon,
+}
+
+impl MaskTool {
+    fn label(self) -> &'static str {
+        match self {
+            MaskTool::Edit => "Select / move",
+            MaskTool::Rect => "Rectangle",
+            MaskTool::Ellipse => "Ellipse",
+            MaskTool::Polygon => "Polygon",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            MaskTool::Edit => {
+                "Click a shape to select it, drag it to move it, drag its handles to reshape it. Right-click a shape to switch include / exclude or delete it (Delete key too)."
+            }
+            MaskTool::Rect => "Drag on either image to draw a rectangle.",
+            MaskTool::Ellipse => "Drag on either image to draw an ellipse.",
+            MaskTool::Polygon => {
+                "Click on either image to add points; double-click, press Enter or click the first point to close the polygon. Esc cancels."
+            }
+        }
+    }
+}
+
+/// A mouse drag in progress on the integrated image (image coordinates).
+enum MaskDrag {
+    /// Drawing a new rectangle / ellipse between two corners.
+    Draw { a: [f32; 2], b: [f32; 2] },
+    /// Moving shape `idx`; `last` is the previous pointer position.
+    Move { idx: usize, last: [f32; 2] },
+    /// Dragging handle `handle` of shape `idx`.
+    Handle { idx: usize, handle: usize },
+}
+
+fn mode_color(mode: RectMode) -> Color32 {
+    match mode {
+        RectMode::Include => MASK_INCLUDE_COLOR,
+        RectMode::Exclude => MASK_EXCLUDE_COLOR,
+    }
 }
 
 /// Messages sent from the background loading thread to the UI.
@@ -327,6 +417,8 @@ pub struct DehydrationApp {
     ipts_scan: Option<Receiver<Vec<u32>>>,
     ipts_filter: String,
 
+    /// Current step of the workflow (what the left panel shows).
+    step: Step,
     view: View,
     frame_idx: usize,
     colormap: Colormap,
@@ -371,11 +463,16 @@ pub struct DehydrationApp {
     mask_error: Option<String>,
     /// Tint the excluded pixels on the image panes.
     show_mask: bool,
-    /// Drag on the integrated image (raw view) adds a mask rectangle.
-    mask_draw: bool,
-    mask_rect_mode: RectMode,
-    /// Rectangle being dragged, image coordinates `[x0, y0, x1, y1]`.
-    mask_drag: Option<[f32; 4]>,
+    /// What the mouse does on the integrated image in the Mask step.
+    mask_tool: MaskTool,
+    /// Include or exclude, for the shapes drawn next.
+    mask_new_mode: RectMode,
+    /// The shape the handles are shown for (index in `mask_spec.shapes`).
+    mask_selected: Option<usize>,
+    /// Drag in progress on the integrated image.
+    mask_drag: Option<MaskDrag>,
+    /// Vertices of the polygon being drawn.
+    mask_poly: Vec<[f32; 2]>,
     /// Range values being edited (kept while the range is disabled).
     mask_range_values: (f32, f32),
     /// Value range of the integrated image (bounds of the range controls).
@@ -456,6 +553,7 @@ impl DehydrationApp {
             ipts_list: None,
             ipts_scan: None,
             ipts_filter: String::new(),
+            step: Step::Data,
             view: View::Raw,
             frame_idx: 0,
             colormap: Colormap::Viridis,
@@ -482,9 +580,11 @@ impl DehydrationApp {
             mask_dirty: false,
             mask_error: None,
             show_mask: true,
-            mask_draw: false,
-            mask_rect_mode: RectMode::Include,
+            mask_tool: MaskTool::Edit,
+            mask_new_mode: RectMode::Include,
+            mask_selected: None,
             mask_drag: None,
+            mask_poly: Vec::new(),
             mask_range_values: (0.0, 1.0),
             integrated_range: (0.0, 1.0),
             right_pane: RightPane::Raw,
@@ -854,172 +954,636 @@ impl DehydrationApp {
         }
     }
 
-    /// The "Mask" section of the left panel.
+    /// The controls of the Mask step (left panel): a summary of what the
+    /// mask selects, then one framed block per way of defining it — shapes
+    /// drawn on the images, a brightness threshold, a mask image file.
     fn mask_section(&mut self, ui: &mut egui::Ui, stack: &ImageStack) {
         let total = stack.height * stack.width;
-        egui::CollapsingHeader::new(egui::RichText::new("Mask").heading())
-            .default_open(true)
-            .show(ui, |ui| {
+        let running = self.corr_job.is_some();
+        ui.heading("Mask (optional)");
+        ui.label(
+            egui::RichText::new(
+                "Choose which pixels are corrected. The pixels left out are not sent to \
+                 mbirtorch and keep their raw values. Skip this step to correct every pixel.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+
+        // ---- what the mask selects right now
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(e) = &self.mask_error {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Mask error: {e}"));
+            } else {
+                match &self.mask {
+                    Some(m) => {
+                        let n = mask::count(m);
+                        let frac = n as f32 / total.max(1) as f32;
+                        ui.label(
+                            egui::RichText::new(format!("{:.1}% of the image will be corrected", 100.0 * frac))
+                                .strong(),
+                        );
+                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                        ui.label(egui::RichText::new(format!("{n} of {total} pixels")).small().weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No mask: the whole image will be corrected").strong());
+                        ui.label(egui::RichText::new(format!("{total} pixels")).small().weak());
+                    }
+                }
+            }
+            if ui
+                .checkbox(&mut self.show_mask, "Shade the pixels left out")
+                .on_hover_text("Tint in dark red, on the images, the pixels the mask leaves out")
+                .changed()
+            {
+                self.tex_dirty = true;
+            }
+        });
+        ui.add_space(6.0);
+
+        ui.add_enabled_ui(!running, |ui| {
+            // ---- 1. shapes
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Draw shapes").strong());
+                ui.label(
+                    egui::RichText::new("On the raw image or the integrated image — a shape shows on both.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    for tool in [MaskTool::Edit, MaskTool::Rect, MaskTool::Ellipse, MaskTool::Polygon] {
+                        if ui
+                            .selectable_label(self.mask_tool == tool, tool.label())
+                            .on_hover_text(tool.hint())
+                            .clicked()
+                        {
+                            self.set_mask_tool(tool);
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("New shapes:");
+                    for (m, tip) in [
+                        (
+                            RectMode::Include,
+                            "Include: only the pixels inside the include shapes (inside any of \
+                             them) are corrected",
+                        ),
+                        (RectMode::Exclude, "Exclude: the pixels inside the shape are left out"),
+                    ] {
+                        ui.radio_value(
+                            &mut self.mask_new_mode,
+                            m,
+                            egui::RichText::new(m.label()).color(mode_color(m)),
+                        )
+                        .on_hover_text(tip);
+                    }
+                });
+                ui.label(egui::RichText::new(self.mask_tool.hint()).small().weak());
+                if self.view != View::Raw {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "The shapes are drawn on the Raw data view.",
+                    );
+                    if ui.button("Show the Raw data view").clicked() {
+                        self.view = View::Raw;
+                        self.tex_dirty = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+                if self.mask_spec.shapes.is_empty() {
+                    ui.weak("No shape yet: pick a tool above and draw on an image.");
+                } else {
+                    // One row per shape: click the name to select it on the
+                    // image, the mode to switch include / exclude, ✖ to delete.
+                    enum Act {
+                        Select(usize),
+                        Toggle(usize),
+                        Remove(usize),
+                    }
+                    let mut act: Option<Act> = None;
+                    egui::Grid::new("mask_shapes")
+                        .num_columns(3)
+                        .spacing([8.0, 3.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (i, shape) in self.mask_spec.shapes.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        self.mask_selected == Some(i),
+                                        format!("{}. {}", i + 1, shape_short_label(shape)),
+                                    )
+                                    .on_hover_text(format!("{} — click to select it on the image", shape.label()))
+                                    .clicked()
+                                {
+                                    act = Some(Act::Select(i));
+                                }
+                                let (text, tip) = match shape.mode {
+                                    RectMode::Include => ("include", "Keeps what is inside — click to exclude instead"),
+                                    RectMode::Exclude => ("exclude", "Leaves out what is inside — click to include instead"),
+                                };
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new(text).color(mode_color(shape.mode))))
+                                    .on_hover_text(tip)
+                                    .clicked()
+                                {
+                                    act = Some(Act::Toggle(i));
+                                }
+                                if ui.small_button("✖").on_hover_text("Delete this shape").clicked() {
+                                    act = Some(Act::Remove(i));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    match act {
+                        Some(Act::Select(i)) => {
+                            self.mask_selected = Some(i);
+                            self.set_mask_tool(MaskTool::Edit);
+                        }
+                        Some(Act::Toggle(i)) => self.mask_toggle_mode(i),
+                        Some(Act::Remove(i)) => self.mask_remove(i),
+                        None => {}
+                    }
+                }
+            });
+            ui.add_space(6.0);
+
+            // ---- 2. brightness threshold on the integrated image
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let mut on = self.mask_spec.range.is_some();
+                if ui
+                    .checkbox(&mut on, egui::RichText::new("Select by brightness").strong())
+                    .on_hover_text(
+                        "Keep only the pixels whose brightness in the integrated image (right \
+                         pane) lies between a minimum and a maximum",
+                    )
+                    .changed()
+                {
+                    self.mask_dirty = true;
+                    logger::log(format!("Mask: select by brightness {}", if on { "on" } else { "off" }));
+                }
                 ui.label(
                     egui::RichText::new(
-                        "Only the selected pixels are sent to mbirtorch; the others keep \
-                         their raw values in the corrected stack. Leave everything off to \
-                         use all pixels.",
+                        "Keep only the pixels whose value in the integrated image (right pane: \
+                         the sum of all the images) lies between a minimum and a maximum. \
+                         Raise the minimum to drop the dark surroundings; lower the maximum to \
+                         drop the open beam around the sample.",
                     )
                     .small()
                     .weak(),
                 );
-                let running = self.corr_job.is_some();
-                ui.add_enabled_ui(!running, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .toggle_value(&mut self.mask_draw, "✏ Draw rectangles")
-                            .on_hover_text(
-                                "Drag on the integrated image (right pane of the Raw data \
-                                 view) to add a rectangle",
-                            )
-                            .changed()
-                            && self.mask_draw
-                        {
-                            self.view = View::Raw;
-                            self.tex_dirty = true;
-                        }
-                        egui::ComboBox::from_id_salt("mask_rect_mode")
-                            .selected_text(self.mask_rect_mode.label())
-                            .show_ui(ui, |ui| {
-                                for m in [RectMode::Include, RectMode::Exclude] {
-                                    ui.selectable_value(&mut self.mask_rect_mode, m, m.label());
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "include: keep only the pixels inside (any of) the include \
-                                 rectangles; exclude: drop the pixels inside",
-                            );
+                let (lo_all, hi_all) = self.integrated_range;
+                let (mut lo, mut hi) = self.mask_range_values;
+                let mut changed = false;
+                ui.add_enabled_ui(on, |ui| {
+                    // The sliders take the width left by the labels and the
+                    // value boxes.
+                    ui.spacing_mut().slider_width = (ui.available_width() - 150.0).max(60.0);
+                    egui::Grid::new("mask_range").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                        ui.label("Minimum");
+                        changed |= ui.add(egui::Slider::new(&mut lo, lo_all..=hi_all)).changed();
+                        ui.end_row();
+                        ui.label("Maximum");
+                        changed |= ui.add(egui::Slider::new(&mut hi, lo_all..=hi_all)).changed();
+                        ui.end_row();
                     });
-                    let mut remove: Option<usize> = None;
-                    for (i, r) in self.mask_spec.rects.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let color = match r.mode {
-                                RectMode::Include => MASK_INCLUDE_COLOR,
-                                RectMode::Exclude => MASK_EXCLUDE_COLOR,
-                            };
-                            ui.colored_label(color, "■");
-                            ui.label(egui::RichText::new(r.label()).small());
-                            if ui.small_button("✖").on_hover_text("Remove this rectangle").clicked() {
-                                remove = Some(i);
-                            }
-                        });
+                });
+                if changed {
+                    if lo > hi {
+                        std::mem::swap(&mut lo, &mut hi);
                     }
-                    if let Some(i) = remove {
-                        let r = self.mask_spec.rects.remove(i);
-                        logger::log(format!("Mask: rectangle removed ({})", r.label()));
-                        self.mask_dirty = true;
-                    }
+                    self.mask_range_values = (lo, hi);
+                    self.mask_dirty = true;
+                }
+                self.mask_spec.range = on.then_some(self.mask_range_values);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This data set goes from {} to {}. Hover the integrated image to read a \
+                         pixel's value in the status bar.",
+                        fmt_axis(lo_all as f64),
+                        fmt_axis(hi_all as f64)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+            ui.add_space(6.0);
 
-                    let mut has_range = self.mask_spec.range.is_some();
-                    let (lo_all, hi_all) = self.integrated_range;
-                    ui.horizontal(|ui| {
-                        if ui
-                            .checkbox(&mut has_range, "Integrated value in")
-                            .on_hover_text(
-                                "Keep the pixels whose summed intensity over the stack (the \
-                                 integrated image) lies in this range — e.g. to leave out the \
-                                 open beam around the sample",
-                            )
-                            .changed()
-                        {
-                            self.mask_dirty = true;
-                        }
-                        let speed = ((hi_all - lo_all) / 500.0).max(1e-6);
-                        let (mut lo, mut hi) = self.mask_range_values;
-                        let r1 = ui.add_enabled(
-                            has_range,
-                            egui::DragValue::new(&mut lo).speed(speed).range(lo_all..=hi_all),
-                        );
-                        ui.label("..");
-                        let r2 = ui.add_enabled(
-                            has_range,
-                            egui::DragValue::new(&mut hi).speed(speed).range(lo_all..=hi_all),
-                        );
-                        if r1.changed() || r2.changed() {
-                            if lo > hi {
-                                std::mem::swap(&mut lo, &mut hi);
-                            }
-                            self.mask_range_values = (lo, hi);
-                            self.mask_dirty = true;
-                        }
-                    });
-                    self.mask_spec.range = has_range.then_some(self.mask_range_values);
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("📂 Load mask…")
-                            .on_hover_text(
-                                "A mask image (TIFF or .npy, nonzero = selected), read with the \
-                                 stack's detector orientation — e.g. one saved here or made with \
-                                 the Hyperspectral Masker",
-                            )
-                            .clicked()
-                        {
-                            self.load_mask_dialog(stack);
-                        }
-                        if ui
-                            .add_enabled(self.mask.is_some(), egui::Button::new("💾 Save mask…"))
-                            .on_hover_text("Write the current mask as an 8-bit TIFF (255 = selected)")
-                            .clicked()
-                        {
-                            self.save_mask_dialog(stack);
-                        }
-                        if ui
-                            .add_enabled(!self.mask_spec.is_empty(), egui::Button::new("Clear"))
-                            .on_hover_text("Remove every rectangle, the range and the file: all pixels")
-                            .clicked()
-                        {
-                            logger::log(format!("Mask cleared (was: {})", self.mask_spec.describe()));
-                            self.mask_spec = MaskSpec::default();
-                            self.mask_dirty = true;
-                        }
-                    });
-                    if let Some(path) = self.mask_spec.file.as_ref().map(|f| f.path.clone()) {
+            // ---- 3. mask image file
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Use a mask image").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "A TIFF or .npy image the size of the frames, non-zero where the pixels \
+                         are kept — one saved here, or made with the Sample / Hyperspectral \
+                         Masker.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                match self.mask_spec.file.as_ref().map(|f| f.path.clone()) {
+                    Some(path) => {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("file: {}", path.display()))
-                                    .small()
-                                    .weak(),
-                            )
-                            .on_hover_text(path.display().to_string());
-                            if ui.small_button("✖").on_hover_text("Drop the mask file").clicked() {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            ui.label(name).on_hover_text(path.display().to_string());
+                            if ui.small_button("✖").on_hover_text("Stop using this mask image").clicked() {
                                 logger::log(format!("Mask: file dropped ({})", path.display()));
                                 self.mask_spec.file = None;
                                 self.mask_dirty = true;
                             }
                         });
-                    }
-                });
-                if ui
-                    .checkbox(&mut self.show_mask, "Show mask (tint the excluded pixels)")
-                    .changed()
-                {
-                    self.tex_dirty = true;
-                }
-                if let Some(e) = &self.mask_error {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("Mask error: {e}"));
-                } else {
-                    match &self.mask {
-                        Some(m) => {
-                            let n = mask::count(m);
-                            ui.label(format!(
-                                "{n} of {total} pixels selected ({:.1}%)",
-                                100.0 * n as f64 / total.max(1) as f64
-                            ));
+                        if ui.button("📂 Load another…").clicked() {
+                            self.load_mask_dialog(stack);
                         }
-                        None => {
-                            ui.weak(format!("No mask: all {total} pixels"));
+                    }
+                    None => {
+                        if ui
+                            .button("📂 Load mask image…")
+                            .on_hover_text("Read with the stack's detector orientation, so it lines up with the images")
+                            .clicked()
+                        {
+                            self.load_mask_dialog(stack);
                         }
                     }
                 }
             });
+            ui.add_space(6.0);
+
+            let parts = [
+                !self.mask_spec.shapes.is_empty(),
+                self.mask_spec.range.is_some(),
+                self.mask_spec.file.is_some(),
+            ]
+            .iter()
+            .filter(|p| **p)
+            .count();
+            if parts > 1 {
+                ui.label(
+                    egui::RichText::new("A pixel is corrected only when it passes every part in use above.")
+                        .small()
+                        .weak(),
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.mask.is_some(), egui::Button::new("💾 Save mask as image…"))
+                    .on_hover_text(
+                        "Write the resulting mask as an 8-bit TIFF (255 = corrected), to load it \
+                         again here or in another tool",
+                    )
+                    .clicked()
+                {
+                    self.save_mask_dialog(stack);
+                }
+                if ui
+                    .add_enabled(!self.mask_spec.is_empty(), egui::Button::new("Clear the mask"))
+                    .on_hover_text("Remove every shape, the brightness selection and the mask image: all pixels")
+                    .clicked()
+                {
+                    logger::log(format!("Mask cleared (was: {})", self.mask_spec.describe()));
+                    self.mask_spec = MaskSpec::default();
+                    self.mask_selected = None;
+                    self.mask_drag = None;
+                    self.mask_poly.clear();
+                    self.mask_dirty = true;
+                }
+            });
+        });
+    }
+
+    /// Whether the mouse edits the mask on the integrated image: in the
+    /// Mask step, on the Raw data view, while no correction runs.
+    fn mask_editing(&self) -> bool {
+        self.step == Step::Mask && self.view == View::Raw && self.corr_job.is_none()
+    }
+
+    fn set_mask_tool(&mut self, tool: MaskTool) {
+        if self.mask_tool != tool {
+            self.mask_tool = tool;
+            self.mask_drag = None;
+            self.mask_poly.clear();
+        }
+    }
+
+    /// Add a shape drawn on the image: tidied, selected, and the tool goes
+    /// back to Select / move so it can be adjusted right away.
+    fn mask_add_shape(&mut self, mut shape: MaskShape, w: usize, h: usize) {
+        if !shape.normalize(w, h) {
+            self.status = format!("The {} was too small — not added.", shape.kind());
+            return;
+        }
+        self.status = format!("Mask: {} {} added.", shape.mode.label(), shape.label());
+        logger::log(&self.status);
+        self.mask_spec.shapes.push(shape);
+        self.mask_selected = Some(self.mask_spec.shapes.len() - 1);
+        self.set_mask_tool(MaskTool::Edit);
+        self.mask_dirty = true;
+    }
+
+    fn mask_toggle_mode(&mut self, i: usize) {
+        let Some(shape) = self.mask_spec.shapes.get_mut(i) else { return };
+        shape.mode = match shape.mode {
+            RectMode::Include => RectMode::Exclude,
+            RectMode::Exclude => RectMode::Include,
+        };
+        self.status = format!("Mask: shape {} is now {} ({}).", i + 1, shape.mode.label(), shape.label());
+        logger::log(&self.status);
+        self.mask_dirty = true;
+    }
+
+    fn mask_remove(&mut self, i: usize) {
+        if i >= self.mask_spec.shapes.len() {
+            return;
+        }
+        let shape = self.mask_spec.shapes.remove(i);
+        logger::log(format!("Mask: shape removed ({} {})", shape.mode.label(), shape.label()));
+        self.mask_selected = None;
+        self.mask_drag = None;
+        self.mask_dirty = true;
+    }
+
+    /// The mask shapes over one pane of the raw view (raw image or
+    /// integrated image) and, in the Mask step, the mouse on them: draw a
+    /// shape with the current tool, or select / move / reshape the existing
+    /// ones. `rect` is the image on screen, `scale` its zoom, `w`×`h` its
+    /// size in pixels; `keys` says whether this call reads the keyboard
+    /// (one pane per frame does).
+    #[allow(clippy::too_many_arguments)]
+    fn mask_overlay(
+        &mut self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        response: &egui::Response,
+        rect: Rect,
+        scale: f32,
+        w: usize,
+        h: usize,
+        keys: bool,
+    ) {
+        let to_screen = |p: [f32; 2]| Pos2::new(rect.left() + p[0] * scale, rect.top() + p[1] * scale);
+        let to_img = |p: Pos2| [(p.x - rect.left()) / scale, (p.y - rect.top()) / scale];
+        let editing = self.mask_editing();
+        if self.mask_selected.is_some_and(|i| i >= self.mask_spec.shapes.len()) {
+            self.mask_selected = None;
+        }
+
+        for (i, shape) in self.mask_spec.shapes.iter().enumerate() {
+            let selected = editing && self.mask_selected == Some(i);
+            let stroke = Stroke::new(if selected { 2.5 } else { 1.5 }, mode_color(shape.mode));
+            paint_shape(painter, shape, stroke, &to_screen);
+            if selected {
+                for hp in shape.handles() {
+                    let r = Rect::from_center_size(to_screen(hp), egui::vec2(8.0, 8.0));
+                    painter.rect_filled(r, 1.0, Color32::WHITE);
+                    painter.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
+                }
+            }
+        }
+        if !editing {
+            return;
+        }
+
+        let hover = response.hover_pos().map(to_img);
+        let pointer = response.interact_pointer_pos().map(to_img);
+        let press = ui
+            .ctx()
+            .input(|i| i.pointer.press_origin())
+            .map(to_img)
+            .or(pointer);
+        // A press on the image takes the keyboard away from the panel (the
+        // tool button just clicked would otherwise keep Enter / Delete).
+        if response.hovered() && ui.ctx().input(|i| i.pointer.any_pressed()) {
+            ui.ctx().memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
+        let no_focus = ui.ctx().memory(|m| m.focused().is_none());
+        let key = |k: egui::Key| keys && no_focus && ui.ctx().input(|i| i.key_pressed(k));
+
+        match self.mask_tool {
+            MaskTool::Edit => {
+                // Handles are grabbed within a few screen pixels.
+                let grab = 7.0 / scale;
+                let handle_at = |shapes: &[MaskShape], sel: Option<usize>, p: [f32; 2]| -> Option<(usize, usize)> {
+                    let idx = sel?;
+                    shapes
+                        .get(idx)?
+                        .handles()
+                        .iter()
+                        .enumerate()
+                        .map(|(k, hp)| (k, (hp[0] - p[0]).hypot(hp[1] - p[1])))
+                        .filter(|(_, d)| *d <= grab)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(k, _)| (idx, k))
+                };
+                // The smallest shape under the pointer, so a shape nested in
+                // a larger one can still be picked.
+                let shape_at = |shapes: &[MaskShape], p: [f32; 2]| -> Option<usize> {
+                    shapes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.contains(p[0], p[1]))
+                        .map(|(i, s)| {
+                            let b = s.bbox();
+                            (i, (b[2] - b[0]) * (b[3] - b[1]))
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(i, _)| i)
+                };
+
+                if self.mask_drag.is_none()
+                    && let Some(p) = hover
+                {
+                    if let Some((idx, k)) = handle_at(&self.mask_spec.shapes, self.mask_selected, p) {
+                        let icon = match self.mask_spec.shapes[idx].geom {
+                            Geom::Polygon(_) => egui::CursorIcon::Crosshair,
+                            _ => {
+                                let (hx, vy) = BOX_HANDLES[k];
+                                cursor_for_handle(hx, vy)
+                            }
+                        };
+                        ui.ctx().set_cursor_icon(icon);
+                    } else if shape_at(&self.mask_spec.shapes, p).is_some() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                    }
+                }
+
+                if response.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(p) = press
+                {
+                    if let Some((idx, handle)) = handle_at(&self.mask_spec.shapes, self.mask_selected, p) {
+                        self.mask_drag = Some(MaskDrag::Handle { idx, handle });
+                    } else {
+                        // Keep moving the selected shape when the press is on
+                        // it; otherwise take the one under the pointer.
+                        let target = match self.mask_selected {
+                            Some(i) if self.mask_spec.shapes[i].contains(p[0], p[1]) => Some(i),
+                            _ => shape_at(&self.mask_spec.shapes, p),
+                        };
+                        self.mask_selected = target;
+                        self.mask_drag = target.map(|idx| MaskDrag::Move { idx, last: p });
+                    }
+                }
+                if response.dragged()
+                    && let Some(p) = pointer
+                {
+                    match &mut self.mask_drag {
+                        Some(MaskDrag::Move { idx, last }) => {
+                            if let Some(shape) = self.mask_spec.shapes.get_mut(*idx) {
+                                shape.translate_within(p[0] - last[0], p[1] - last[1], w, h);
+                                self.mask_dirty = true;
+                            }
+                            *last = p;
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                        }
+                        Some(MaskDrag::Handle { idx, handle }) => {
+                            if let Some(shape) = self.mask_spec.shapes.get_mut(*idx) {
+                                shape.drag_handle(*handle, p);
+                                self.mask_dirty = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if response.drag_stopped()
+                    && let Some(MaskDrag::Move { idx, .. } | MaskDrag::Handle { idx, .. }) = self.mask_drag.take()
+                    && let Some(shape) = self.mask_spec.shapes.get_mut(idx)
+                {
+                    if shape.normalize(w, h) {
+                        self.status = format!("Mask: shape {} is now {} {}.", idx + 1, shape.mode.label(), shape.label());
+                        logger::log(&self.status);
+                    } else {
+                        // Reshaped down to nothing.
+                        self.mask_remove(idx);
+                    }
+                    self.mask_dirty = true;
+                }
+                if (response.clicked() || response.secondary_clicked())
+                    && let Some(p) = pointer.or(hover)
+                {
+                    self.mask_selected = shape_at(&self.mask_spec.shapes, p);
+                }
+                response.context_menu(|ui| match self.mask_selected {
+                    Some(i) if i < self.mask_spec.shapes.len() => {
+                        let other = match self.mask_spec.shapes[i].mode {
+                            RectMode::Include => RectMode::Exclude,
+                            RectMode::Exclude => RectMode::Include,
+                        };
+                        ui.label(egui::RichText::new(self.mask_spec.shapes[i].label()).small().weak());
+                        if ui.button(format!("Switch to {}", other.label())).clicked() {
+                            self.mask_toggle_mode(i);
+                            ui.close();
+                        }
+                        if ui.button("✖ Delete").clicked() {
+                            self.mask_remove(i);
+                            ui.close();
+                        }
+                    }
+                    _ => {
+                        ui.weak("No shape here");
+                    }
+                });
+                if let Some(i) = self.mask_selected {
+                    if key(egui::Key::Delete) || key(egui::Key::Backspace) {
+                        self.mask_remove(i);
+                    } else if key(egui::Key::Escape) {
+                        self.mask_selected = None;
+                    }
+                }
+            }
+            MaskTool::Rect | MaskTool::Ellipse => {
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(p) = press
+                {
+                    self.mask_drag = Some(MaskDrag::Draw { a: p, b: p });
+                }
+                if (response.dragged() || response.drag_stopped())
+                    && let (Some(MaskDrag::Draw { b, .. }), Some(p)) = (&mut self.mask_drag, pointer)
+                {
+                    *b = p;
+                }
+                let make = |tool: MaskTool, a: [f32; 2], b: [f32; 2], mode: RectMode| match tool {
+                    MaskTool::Ellipse => MaskShape::ellipse(a, b, mode),
+                    _ => MaskShape::rect(a, b, mode),
+                };
+                if let Some(MaskDrag::Draw { a, b }) = &self.mask_drag {
+                    let preview = make(self.mask_tool, *a, *b, self.mask_new_mode);
+                    paint_shape(painter, &preview, Stroke::new(2.0, Color32::YELLOW), &to_screen);
+                }
+                if response.drag_stopped()
+                    && let Some(MaskDrag::Draw { a, b }) = self.mask_drag.take()
+                {
+                    self.mask_add_shape(make(self.mask_tool, a, b, self.mask_new_mode), w, h);
+                }
+                if key(egui::Key::Escape) {
+                    self.set_mask_tool(MaskTool::Edit);
+                }
+            }
+            MaskTool::Polygon => {
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                let reach = 8.0 / scale;
+                let near_first = |poly: &[[f32; 2]], p: [f32; 2]| {
+                    poly.len() >= 3 && (poly[0][0] - p[0]).hypot(poly[0][1] - p[1]) <= reach
+                };
+                let mut finish = false;
+                if response.clicked()
+                    && let Some(p) = pointer.or(hover)
+                {
+                    if near_first(&self.mask_poly, p) {
+                        finish = true;
+                    } else {
+                        self.mask_poly.push([p[0].clamp(0.0, w as f32), p[1].clamp(0.0, h as f32)]);
+                    }
+                }
+                if (response.double_clicked() || key(egui::Key::Enter)) && self.mask_poly.len() >= 3 {
+                    finish = true;
+                }
+                if key(egui::Key::Escape) {
+                    if self.mask_poly.is_empty() {
+                        self.set_mask_tool(MaskTool::Edit);
+                    }
+                    self.mask_poly.clear();
+                }
+                if finish {
+                    let points = std::mem::take(&mut self.mask_poly);
+                    self.mask_add_shape(MaskShape::polygon(points, self.mask_new_mode), w, h);
+                } else if !self.mask_poly.is_empty() {
+                    let stroke = Stroke::new(2.0, Color32::YELLOW);
+                    let mut line: Vec<Pos2> = self.mask_poly.iter().map(|p| to_screen(*p)).collect();
+                    if let Some(p) = hover {
+                        line.push(to_screen(p));
+                    }
+                    painter.add(egui::Shape::line(line, stroke));
+                    // The first point: click it to close the polygon.
+                    let closable = hover.is_some_and(|p| near_first(&self.mask_poly, p));
+                    painter.circle(
+                        to_screen(self.mask_poly[0]),
+                        if closable { 6.0 } else { 4.0 },
+                        if closable { Color32::YELLOW } else { Color32::TRANSPARENT },
+                        stroke,
+                    );
+                }
+            }
+        }
     }
 
     // ----- loading -----------------------------------------------------------
@@ -1260,6 +1824,11 @@ impl DehydrationApp {
         self.integrated_raw = Some(acc);
         self.mask_dirty = true;
         self.mask_drag = None;
+        self.mask_poly.clear();
+        // A new stack has no result yet: the last two steps are closed.
+        if matches!(self.step, Step::Review | Step::Export) {
+            self.step = Step::Data;
+        }
 
         // TOF axis from the folder's *_Spectra.txt, when it matches the
         // stack (one TOF value per image).
@@ -1438,6 +2007,7 @@ impl DehydrationApp {
                     .clamped(w, h),
                 );
                 self.profiles_dirty = true;
+                self.step = Step::Review;
                 self.view = View::Result;
                 self.contrast_auto = true;
                 self.tex_dirty = true;
@@ -1714,7 +2284,11 @@ impl DehydrationApp {
             .unwrap_or_default();
         match self.view {
             View::Raw => (
-                format!("Raw image #{}", self.frame_idx),
+                if self.mask_editing() {
+                    format!("Raw image #{} — draw and edit the mask on either image", self.frame_idx)
+                } else {
+                    format!("Raw image #{}", self.frame_idx)
+                },
                 "Integrated image (sum)".to_owned(),
             ),
             View::Result => (
@@ -2431,7 +3005,7 @@ impl DehydrationApp {
                 .region
                 .map(|r| [r.left, r.right, r.top, r.bottom]),
             input_folder: self.input_dir.clone(),
-            mask_rects: self.mask_spec.rects.clone(),
+            mask_shapes: self.mask_spec.shapes.clone(),
             mask_range: self.mask_spec.range,
             mask_file: self.mask_spec.file.as_ref().map(|f| f.path.clone()),
         }
@@ -2460,7 +3034,9 @@ impl DehydrationApp {
         }
         // The mask definition; a mask file is re-read with the loaded
         // stack's orientation (it needs a stack to line up with).
-        self.mask_spec.rects = cfg.mask_rects.clone();
+        self.mask_spec.shapes = cfg.mask_shapes.clone();
+        self.mask_selected = None;
+        self.mask_drag = None;
         self.mask_spec.range = cfg.mask_range;
         if let Some(range) = cfg.mask_range {
             self.mask_range_values = range;
@@ -2552,6 +3128,8 @@ impl DehydrationApp {
                 {
                     self.show_about = true;
                 }
+                crate::zoom::toggle_button(ui);
+                crate::theme::toggle_button(ui);
                 let has_plots = self
                     .result
                     .as_ref()
@@ -2587,64 +3165,12 @@ impl DehydrationApp {
         });
     }
 
-    /// The left-flowing part of the toolbar (everything except the
-    /// right-aligned mbirtorch button).
+    /// The left-flowing part of the toolbar: what the image panes show and
+    /// how (view, image, contrast, colormap, zoom). The workflow itself is in
+    /// the step bar above and the left panel.
     fn toolbar_left(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            let busy = self.loading.is_some();
-            let ctx = ui.ctx().clone();
-            self.ipts_combo(ui);
-            if ui
-                .add_enabled(!busy, egui::Button::new("📁 Open Folder…"))
-                .clicked()
-            {
-                self.open_folder_dialog(&ctx);
-            }
-            if ui
-                .add_enabled(!busy, egui::Button::new("📂 Open Files…"))
-                .clicked()
-            {
-                self.open_files_dialog(&ctx);
-            }
-            ui.add_enabled_ui(!busy && !self.recent.is_empty(), |ui| {
-                ui.menu_button("🕒 Recent", |ui| {
-                    self.recent_menu(ui, &ctx);
-                });
-            });
-            if ui
-                .add_enabled(!busy, egui::Button::new("🔍 Run number…"))
-                .on_hover_text(
-                    "Locate a run's images from its run number: finds its NeXus file, \
-                     then the raw data — and, for a Timepix run, lets you pick the raw \
-                     or the autoreduce version (also sets the detector and its offset)",
-                )
-                .clicked()
-            {
-                self.open_run_dialog();
-            }
-            ui.add_enabled_ui(!busy, |ui| self.detector_combo(ui, &ctx));
-            ui.menu_button("⚙ Config", |ui| {
-                if ui
-                    .button("💾 Save settings to HDF5…")
-                    .on_hover_text(
-                        "Write the correction parameters, physical axis, display \
-                         settings, and profile region to a .h5 config file",
-                    )
-                    .clicked()
-                {
-                    self.save_config_dialog();
-                }
-                if ui
-                    .button("📂 Load settings from HDF5…")
-                    .on_hover_text("Apply the settings from a previously saved .h5 config file")
-                    .clicked()
-                {
-                    self.load_config_dialog();
-                }
-            });
-
-            ui.separator();
-
+            ui.label("View:");
             let has_result = self.result.is_some();
             let mut changed = false;
             changed |= ui
@@ -2658,21 +3184,6 @@ impl DehydrationApp {
                     .selectable_value(&mut self.view, View::Profiles, "Profiles")
                     .changed();
             });
-
-            if self.view == View::Result {
-                ui.separator();
-                ui.label("vs:");
-                changed |= ui
-                    .selectable_value(&mut self.right_pane, RightPane::Raw, "Raw")
-                    .changed();
-                changed |= ui
-                    .selectable_value(&mut self.right_pane, RightPane::Difference, "Difference")
-                    .on_hover_text(
-                        "corrected − raw on a symmetric color range: structure here is \
-                         what the correction removed (or invented)",
-                    )
-                    .changed();
-            }
 
             let n_frames = self.stack.as_ref().map(|s| s.n_frames()).unwrap_or(0);
             if matches!(self.view, View::Raw | View::Result) && n_frames > 1 {
@@ -2748,16 +3259,237 @@ impl DehydrationApp {
                 self.fit_requested = true;
             }
             ui.label(format!("{:.0}%", self.scale * 100.0));
-
-            ui.separator();
-            crate::theme::toggle_button(ui);
-            crate::zoom::toggle_button(ui);
         });
     }
 
-    fn params_panel(&mut self, ui: &mut egui::Ui) {
+    // ----- workflow: steps ----------------------------------------------------
+
+    /// Whether a step can be opened, or what has to be done first.
+    fn step_enabled(&self, step: Step) -> Result<(), &'static str> {
+        match step {
+            Step::Data => Ok(()),
+            Step::Mask | Step::Correct => {
+                if self.stack.is_some() { Ok(()) } else { Err("Load data first (step 1)") }
+            }
+            Step::Review | Step::Export => {
+                if self.result.is_some() {
+                    Ok(())
+                } else if self.stack.is_some() {
+                    Err("Run the correction first (step 3)")
+                } else {
+                    Err("Load data first (step 1)")
+                }
+            }
+        }
+    }
+
+    /// (done, one line under the step's title) for the step bar.
+    fn step_status(&self, step: Step) -> (bool, String) {
+        match step {
+            Step::Data => match (&self.loading, &self.stack) {
+                (Some(_), _) => (false, "loading…".to_owned()),
+                (None, Some(s)) => (true, format!("{} images, {}×{} px", s.n_frames(), s.width, s.height)),
+                (None, None) => (false, "no data yet".to_owned()),
+            },
+            Step::Mask => match &self.mask {
+                Some(m) => (
+                    true,
+                    format!("{:.0}% of the pixels", 100.0 * mask::count(m) as f64 / m.len().max(1) as f64),
+                ),
+                None => (false, "optional — all pixels".to_owned()),
+            },
+            Step::Correct => {
+                if let Some(job) = &self.corr_job {
+                    (false, format!("running… {:.0}%", job.fraction * 100.0))
+                } else {
+                    match &self.result {
+                        Some(r) if r.is_preview() => (false, "preview only".to_owned()),
+                        Some(r) if r.params != self.params => (true, "parameters changed".to_owned()),
+                        Some(r) => (true, format!("done in {:.0} s", r.elapsed_seconds)),
+                        None => (false, "not run yet".to_owned()),
+                    }
+                }
+            }
+            Step::Review => match &self.result {
+                Some(r) => (
+                    self.last_export.is_some(),
+                    match r.report.rank {
+                        Some(n) => format!("{n} material(s) found"),
+                        None => "result ready".to_owned(),
+                    },
+                ),
+                None => (false, "after the correction".to_owned()),
+            },
+            Step::Export => match (&self.export_job, &self.last_export, &self.result) {
+                (Some(_), _, _) => (false, "exporting…".to_owned()),
+                (None, Some(_), _) => (true, "exported".to_owned()),
+                (None, None, Some(r)) if r.is_preview() => (false, "needs a full run".to_owned()),
+                _ => (false, "not exported yet".to_owned()),
+            },
+        }
+    }
+
+    /// Open a step: the left panel follows, and the image panes show what
+    /// the step works on.
+    fn set_step(&mut self, step: Step) {
+        if self.step == step || self.step_enabled(step).is_err() {
+            return;
+        }
+        logger::log(format!("Step: {}", step.title()));
+        self.step = step;
+        match step {
+            Step::Data | Step::Mask => self.view = View::Raw,
+            Step::Correct => {}
+            Step::Review | Step::Export => {
+                if self.view == View::Raw && self.result.is_some() {
+                    self.view = View::Result;
+                }
+            }
+        }
+        self.mask_drag = None;
+        self.mask_poly.clear();
+        self.mask_tool = MaskTool::Edit;
+        self.tex_dirty = true;
+    }
+
+    /// The workflow, left to right: numbered steps with their state, the
+    /// current one highlighted. Click a step to open it.
+    fn step_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(3.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let mut go = None;
+            let mut prev_done = false;
+            for (k, step) in Step::ALL.into_iter().enumerate() {
+                let (done, hint) = self.step_status(step);
+                if k > 0 {
+                    step_connector(ui, prev_done);
+                }
+                let enabled = self.step_enabled(step);
+                let resp = step_chip(ui, k + 1, step.title(), &hint, done, enabled.is_ok(), self.step == step);
+                let resp = resp.on_hover_text(match enabled {
+                    Ok(()) => step.help(),
+                    Err(why) => why,
+                });
+                if resp.clicked() && enabled.is_ok() {
+                    go = Some(step);
+                }
+                prev_done = done;
+            }
+            if let Some(step) = go {
+                self.set_step(step);
+            }
+        });
+        ui.add_space(3.0);
+    }
+
+    /// Back / Next at the bottom of the left panel.
+    fn step_nav(&mut self, ui: &mut egui::Ui) {
+        let i = self.step.index();
+        let mut go = None;
+        ui.horizontal(|ui| {
+            if i > 0 {
+                let prev = Step::ALL[i - 1];
+                if ui.button(format!("◀ {}", prev.title())).on_hover_text(prev.help()).clicked() {
+                    go = Some(prev);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(&next) = Step::ALL.get(i + 1) {
+                    let enabled = self.step_enabled(next);
+                    let label = egui::RichText::new(format!("Next: {} ▶", next.title())).strong();
+                    let resp = ui
+                        .add_enabled(enabled.is_ok(), egui::Button::new(label))
+                        .on_hover_text(next.help())
+                        .on_disabled_hover_text(enabled.err().unwrap_or_default());
+                    if resp.clicked() {
+                        go = Some(next);
+                    }
+                }
+            });
+        });
+        if let Some(step) = go {
+            self.set_step(step);
+        }
+    }
+
+    /// The controls of the current step (left panel).
+    fn step_panel(&mut self, ui: &mut egui::Ui) {
+        match self.step {
+            Step::Data => self.step_data(ui),
+            Step::Mask => match self.stack.clone() {
+                Some(stack) => self.mask_section(ui, &stack),
+                None => {
+                    ui.label("Load data first.");
+                }
+            },
+            Step::Correct => self.step_correct(ui),
+            Step::Review => self.step_review(ui),
+            Step::Export => self.step_export(ui),
+        }
+    }
+
+    /// Step 1: choose the data.
+    fn step_data(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Load data");
+        ui.label(
+            egui::RichText::new(
+                "The stack of images to correct: a folder of TIFF files (one per TOF bin), a \
+                 selection of files, or a run located from its number. A folder or files can \
+                 also be dropped on the window.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+        let busy = self.loading.is_some();
+        let ctx = ui.ctx().clone();
+        ui.horizontal_wrapped(|ui| {
+            self.ipts_combo(ui);
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("📁 Open Folder…"))
+                .clicked()
+            {
+                self.open_folder_dialog(&ctx);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("📂 Open Files…"))
+                .clicked()
+            {
+                self.open_files_dialog(&ctx);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("🔍 Run number…"))
+                .on_hover_text(
+                    "Locate a run's images from its run number: finds its NeXus file, \
+                     then the raw data — and, for a Timepix run, lets you pick the raw \
+                     or the autoreduce version (also sets the detector and its offset)",
+                )
+                .clicked()
+            {
+                self.open_run_dialog();
+            }
+            ui.add_enabled_ui(!busy && !self.recent.is_empty(), |ui| {
+                ui.menu_button("🕒 Recent", |ui| {
+                    self.recent_menu(ui, &ctx);
+                });
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!busy, |ui| self.detector_combo(ui, &ctx));
+        });
+        ui.add_space(6.0);
+        ui.separator();
+
+        if self.stack.is_none() {
+            ui.weak("No data loaded yet.");
+        }
         if let Some(stack) = &self.stack {
-            ui.heading("Data set");
+            ui.label(egui::RichText::new("Data set").strong());
             ui.add_space(2.0);
             if let Some(dir) = &self.input_dir {
                 ui.label(
@@ -2801,16 +3533,24 @@ impl DehydrationApp {
                 )
                 .on_hover_text("First and last image file of the stack");
             }
-            ui.add_space(6.0);
-            ui.separator();
         }
-
-        if let Some(stack) = self.stack.clone() {
-            self.mask_section(ui, &stack);
-            ui.add_space(6.0);
-            ui.separator();
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Settings from an earlier session").strong());
+        if ui
+            .button("📂 Load settings from HDF5…")
+            .on_hover_text(
+                "Apply the mask, the correction parameters and the display settings of a \
+                 .h5 config file saved in the Export step",
+            )
+            .clicked()
+        {
+            self.load_config_dialog();
         }
+    }
 
+    /// Step 3: the parameters and the run.
+    fn step_correct(&mut self, ui: &mut egui::Ui) {
         ui.heading("Correction parameters");
         ui.label(
             egui::RichText::new("mbirtorch.hsnt denoise — maximum-likelihood factorization")
@@ -3064,10 +3804,20 @@ impl DehydrationApp {
                 }
             });
         }
-
-        if let Some(result) = &self.result {
-            ui.add_space(10.0);
+        if self.result.is_some() && self.corr_job.is_none() {
+            ui.add_space(8.0);
             ui.separator();
+            let (_, hint) = self.step_status(Step::Correct);
+            ui.label(format!("A result is available ({hint})."));
+            if ui.button("Review the result ▶").clicked() {
+                self.set_step(Step::Review);
+            }
+        }
+    }
+
+    /// Step 4: what the correction found, and what to look at.
+    fn step_review(&mut self, ui: &mut egui::Ui) {
+        if let Some(result) = &self.result {
             if result.is_preview() {
                 ui.heading(format!("Result — PREVIEW ({0}×{0} binned)", result.bin));
             } else {
@@ -3153,8 +3903,92 @@ impl DehydrationApp {
                     "Parameters changed since this result — run again to apply.",
                 );
             }
+        } else {
+            ui.label("Run the correction first.");
+            return;
+        }
 
-            ui.add_space(8.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Look at").strong());
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .selectable_value(&mut self.view, View::Result, "Corrected vs raw")
+                .on_hover_text("The corrected image next to the raw one, image by image")
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.view, View::Profiles, "Profiles")
+                .on_hover_text(
+                    "Mean intensity of a region (and of one pixel) along the stack, before \
+                     and after the correction",
+                )
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.view, View::Raw, "Raw data")
+                .changed();
+        });
+        if self.view == View::Result {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Right pane:");
+                changed |= ui
+                    .selectable_value(&mut self.right_pane, RightPane::Raw, "Raw")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut self.right_pane, RightPane::Difference, "Difference")
+                    .on_hover_text(
+                        "corrected − raw on a symmetric color range: structure here is \
+                         what the correction removed (or invented)",
+                    )
+                    .changed();
+            });
+        }
+        if changed {
+            self.tex_dirty = true;
+        }
+        ui.horizontal_wrapped(|ui| {
+            let has_plots = self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.artifacts.iter().any(|a| a.name.ends_with(".png")));
+            if ui
+                .add_enabled(has_plots, egui::Button::new("📈 Diagnostics"))
+                .on_hover_text("The component spectra and maps plotted by mbirtorch, and its data checks")
+                .clicked()
+            {
+                self.show_diagnostics = !self.show_diagnostics;
+            }
+            if ui
+                .add_enabled(!self.run_log.is_empty(), egui::Button::new("📜 Log"))
+                .on_hover_text("Everything the mbirtorch command line printed during the correction")
+                .clicked()
+            {
+                self.show_log = !self.show_log;
+            }
+        });
+    }
+
+    /// Step 5: write the corrected stack.
+    fn step_export(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Export");
+        ui.label(
+            egui::RichText::new(
+                "The corrected stack as 32-bit float TIFFs (input names kept) in a new \
+                 subfolder named after the input folder, with the parameters, the mask, the \
+                 mbirtorch report and its plots.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+        let ctx = ui.ctx().clone();
+        if let Some(result) = &self.result {
+            if result.is_preview() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "The current result is a preview (binned): run the full correction to export.",
+                );
+            }
             if let Some(job) = &self.export_job {
                 let frac = if job.total > 0 {
                     job.done as f32 / job.total as f32
@@ -3192,6 +4026,23 @@ impl DehydrationApp {
                         .weak(),
                 );
             }
+        } else {
+            ui.label("Run the correction first.");
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Settings").strong());
+        if ui
+            .button("💾 Save settings to HDF5…")
+            .on_hover_text(
+                "Write the mask, the correction parameters, the physical axis, the display \
+                 settings and the profile region to a .h5 config file, to load them again \
+                 here or in the workflow runner",
+            )
+            .clicked()
+        {
+            self.save_config_dialog();
         }
     }
 
@@ -3249,7 +4100,10 @@ impl DehydrationApp {
         }
         if self.stack.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("No images loaded — use 'Open Folder…' to select the data to correct.");
+                ui.label(
+                    "No images loaded — step 1: use 'Open Folder…' in the left panel (or drop a \
+                     folder here) to select the data to correct.",
+                );
             });
             return;
         }
@@ -3316,18 +4170,11 @@ impl DehydrationApp {
         let view_h =
             (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(160.0);
 
-        // Mask rectangles are drawn (and shown) on the integrated image, the
-        // right pane of the raw view. The drag is tracked in local state and
-        // committed after the panes are laid out.
-        let draw_mask = self.mask_draw && self.view == View::Raw;
-        let rects: Vec<MaskRect> = if self.view == View::Raw && (self.show_mask || draw_mask) {
-            self.mask_spec.rects.clone()
-        } else {
-            Vec::new()
-        };
-        let rect_mode = self.mask_rect_mode;
-        let mut drag = self.mask_drag;
-        let mut committed: Option<MaskRect> = None;
+        // The mask shapes are shown — and, in the Mask step, drawn and edited —
+        // on both panes of the raw view: the raw image and the integrated
+        // image have the same pixels, so a shape is the same on either.
+        let mask_edit = self.mask_editing();
+        let show_shapes = self.view == View::Raw && (self.show_mask || mask_edit);
 
         ui.horizontal_top(|ui| {
             let avail = ui.available_size();
@@ -3360,8 +4207,7 @@ impl DehydrationApp {
                         let mut cursor = None;
                         for (k, (tex, img)) in panes.iter().enumerate() {
                             let Some(tex) = tex else { continue };
-                            let mask_pane = k == 1;
-                            let sense = if draw_mask && mask_pane {
+                            let sense = if mask_edit {
                                 Sense::click_and_drag()
                             } else {
                                 Sense::hover()
@@ -3373,62 +4219,11 @@ impl DehydrationApp {
                             let to_img = |p: Pos2| -> (f32, f32) {
                                 ((p.x - rect.left()) / scale, (p.y - rect.top()) / scale)
                             };
-                            let to_screen = |ix: f32, iy: f32| -> Pos2 {
-                                Pos2::new(rect.left() + ix * scale, rect.top() + iy * scale)
-                            };
 
-                            if mask_pane {
-                                for r in &rects {
-                                    let color = match r.mode {
-                                        RectMode::Include => MASK_INCLUDE_COLOR,
-                                        RectMode::Exclude => MASK_EXCLUDE_COLOR,
-                                    };
-                                    painter.rect_stroke(
-                                        Rect::from_min_max(
-                                            to_screen(r.left as f32, r.top as f32),
-                                            to_screen(r.right as f32, r.bottom as f32),
-                                        ),
-                                        egui::CornerRadius::ZERO,
-                                        Stroke::new(1.5, color),
-                                        egui::StrokeKind::Middle,
-                                    );
-                                }
-                                if draw_mask {
-                                    if response.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                                    }
-                                    if response.drag_started()
-                                        && let Some(sp) = ui
-                                            .ctx()
-                                            .input(|i| i.pointer.press_origin())
-                                            .or_else(|| response.interact_pointer_pos())
-                                    {
-                                        let p = to_img(sp);
-                                        drag = Some([p.0, p.1, p.0, p.1]);
-                                    }
-                                    if (response.dragged() || response.drag_stopped())
-                                        && let (Some(d), Some(sp)) =
-                                            (drag.as_mut(), response.interact_pointer_pos())
-                                    {
-                                        let p = to_img(sp);
-                                        d[2] = p.0;
-                                        d[3] = p.1;
-                                    }
-                                    if let Some(d) = drag {
-                                        painter.rect_stroke(
-                                            Rect::from_two_pos(to_screen(d[0], d[1]), to_screen(d[2], d[3])),
-                                            egui::CornerRadius::ZERO,
-                                            Stroke::new(2.0, Color32::YELLOW),
-                                            egui::StrokeKind::Middle,
-                                        );
-                                    }
-                                    if response.drag_stopped()
-                                        && let Some(d) = drag.take()
-                                    {
-                                        committed =
-                                            MaskRect::from_corners((d[0], d[1]), (d[2], d[3]), w, h, rect_mode);
-                                    }
-                                }
+                            if show_shapes {
+                                // The keyboard is read once per frame, by
+                                // the last pane.
+                                self.mask_overlay(ui, &painter, &response, rect, scale, w, h, k == 1);
                             }
 
                             if let (Some(p), Some(img)) = (response.hover_pos(), img) {
@@ -3465,12 +4260,6 @@ impl DehydrationApp {
             self.colorbar(ui, view_h);
         });
 
-        self.mask_drag = drag;
-        if let Some(r) = committed {
-            logger::log(format!("Mask: rectangle added ({})", r.label()));
-            self.mask_spec.rects.push(r);
-            self.mask_dirty = true;
-        }
     }
 
     /// Profiles view: the integrated corrected image with a draggable region
@@ -3988,6 +4777,133 @@ impl DehydrationApp {
     }
 }
 
+/// One step of the step bar: a numbered disc (a check mark once the step is
+/// done), its title and a line of status. Clickable when `enabled`.
+fn step_chip(
+    ui: &mut egui::Ui,
+    number: usize,
+    title: &str,
+    hint: &str,
+    done: bool,
+    enabled: bool,
+    selected: bool,
+) -> egui::Response {
+    const DONE_COLOR: Color32 = Color32::from_rgb(60, 160, 90);
+    let v = ui.visuals().clone();
+    let title_color = if !enabled {
+        v.weak_text_color()
+    } else if selected {
+        v.strong_text_color()
+    } else {
+        v.text_color()
+    };
+    let title_g = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), egui::FontId::proportional(15.0), title_color);
+    let hint_g = ui
+        .painter()
+        .layout_no_wrap(hint.to_owned(), egui::FontId::proportional(11.0), v.weak_text_color());
+    let (radius, pad, gap) = (13.0, 8.0, 8.0);
+    let text_w = title_g.size().x.max(hint_g.size().x);
+    let size = egui::vec2(pad + 2.0 * radius + gap + text_w + pad, 44.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 6.0, v.selection.bg_fill.gamma_multiply(0.35));
+        painter.rect_stroke(
+            rect,
+            6.0,
+            Stroke::new(1.5, v.selection.stroke.color),
+            egui::StrokeKind::Inside,
+        );
+    } else if enabled && response.hovered() {
+        painter.rect_filled(rect, 6.0, v.widgets.hovered.weak_bg_fill);
+    }
+    let center = Pos2::new(rect.left() + pad + radius, rect.center().y);
+    let (fill, ink) = if done {
+        (DONE_COLOR, Color32::WHITE)
+    } else if selected {
+        (v.selection.stroke.color, v.panel_fill)
+    } else {
+        (v.widgets.inactive.bg_fill, title_color)
+    };
+    painter.circle_filled(center, radius, fill);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        if done { "✔".to_owned() } else { number.to_string() },
+        egui::FontId::proportional(14.0),
+        ink,
+    );
+    let x = center.x + radius + gap;
+    let (title_h, hint_h) = (title_g.size().y, hint_g.size().y);
+    let y = rect.center().y - (title_h + hint_h) * 0.5;
+    painter.galley(Pos2::new(x, y), title_g, title_color);
+    painter.galley(Pos2::new(x, y + title_h), hint_g, v.weak_text_color());
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// The line between two steps of the step bar, green once the step before
+/// it is done.
+fn step_connector(ui: &mut egui::Ui, done: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 44.0), Sense::hover());
+    let color = if done {
+        Color32::from_rgb(60, 160, 90)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    };
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + 5.0, rect.center().y),
+            Pos2::new(rect.right() - 5.0, rect.center().y),
+        ],
+        Stroke::new(2.0, color),
+    );
+}
+
+/// The outline of a mask shape on screen.
+fn paint_shape(painter: &egui::Painter, shape: &MaskShape, stroke: Stroke, to_screen: &dyn Fn([f32; 2]) -> Pos2) {
+    let [x0, y0, x1, y1] = shape.bbox();
+    match &shape.geom {
+        Geom::Rect(_) => {
+            painter.rect_stroke(
+                Rect::from_min_max(to_screen([x0, y0]), to_screen([x1, y1])),
+                egui::CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        Geom::Ellipse(_) => {
+            let (a, b) = (to_screen([x0, y0]), to_screen([x1, y1]));
+            painter.add(egui::Shape::ellipse_stroke(
+                a + (b - a) * 0.5,
+                (b - a) * 0.5,
+                stroke,
+            ));
+        }
+        Geom::Polygon(points) => {
+            painter.add(egui::Shape::closed_line(
+                points.iter().map(|p| to_screen(*p)).collect(),
+                stroke,
+            ));
+        }
+    }
+}
+
+/// A shape in a few words, for the list of the Mask step.
+fn shape_short_label(shape: &MaskShape) -> String {
+    let [x0, y0, x1, y1] = shape.bbox();
+    match &shape.geom {
+        Geom::Polygon(points) => format!("polygon, {} points", points.len()),
+        _ => format!("{} {:.0}×{:.0}", shape.kind(), x1 - x0, y1 - y0),
+    }
+}
+
 fn drag_usize(ui: &mut egui::Ui, v: &mut usize, max: usize) -> bool {
     ui.add(egui::DragValue::new(v).speed(1).range(0..=max)).changed()
 }
@@ -4107,6 +5023,9 @@ impl eframe::App for DehydrationApp {
         self.ensure_textures(&ctx);
         self.handle_drops(&ctx);
 
+        egui::Panel::top("steps").show(ui, |ui| {
+            self.step_bar(ui);
+        });
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(ui);
         });
@@ -4115,20 +5034,23 @@ impl eframe::App for DehydrationApp {
         });
         egui::Panel::left("params")
             .resizable(true)
-            .default_size(300.0)
+            .default_size(330.0)
             .show(ui, |ui| {
-                // Logos pinned to the bottom-left corner of the window: the
-                // parameters scroll in the space above an explicitly reserved
-                // logo row, and a spacer pushes the row to the very bottom
-                // when the parameters are short.
-                let logo_row_height = LOGO_HEIGHT + 24.0;
-                let scroll_height = (ui.available_height() - logo_row_height).max(0.0);
+                // The controls of the current step scroll in the space above
+                // two rows pinned to the bottom of the panel: Back / Next,
+                // then the logos (a spacer pushes them down when the step is
+                // short).
+                let fixed_height = LOGO_HEIGHT + 24.0 + 38.0;
+                let scroll_height = (ui.available_height() - fixed_height).max(0.0);
                 egui::ScrollArea::vertical()
+                    .id_salt(("step_panel", self.step.index()))
                     .max_height(scroll_height)
                     .show(ui, |ui| {
-                        self.params_panel(ui);
+                        self.step_panel(ui);
                     });
-                ui.add_space((ui.available_height() - logo_row_height).max(0.0));
+                ui.add_space((ui.available_height() - fixed_height).max(0.0));
+                ui.separator();
+                self.step_nav(ui);
                 ui.separator();
                 self.logos_row(ui);
             });

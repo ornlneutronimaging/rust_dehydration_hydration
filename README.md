@@ -78,18 +78,66 @@ work not yet merged) — no rebuild of this program is needed. The
 package of v0.1.2 (2026-10-09) is the `hsnt` branch at edb0bcb with
 docstring edits only; its command line, solvers and outputs are the same.
 
-## Workflow (same as the notebook)
+## Workflow
 
-1. **Open Folder…** / **Open Files…** / **🕒 Recent** / **🔍 Run number…**
+The window follows the workflow in five steps. The **step bar** at the top
+shows them in order, each with its state (a green ✔ once done, a line of
+status under the title); the current step is highlighted and the **left
+panel** holds its controls only. Click a step, or use **◀ Back** /
+**Next ▶** at the bottom of the panel, to move; a step that is not possible
+yet (no data, no result) is greyed out and says what is missing. The toolbar
+under the step bar only sets what the image panes show: view, image,
+contrast, colormap, zoom.
+
+1. **Load data** — **Open Folder…** / **Open Files…** / **🕒 Recent** / **🔍 Run number…**
    (`-r/--run-number N`, NeXus lookup: detector, image folder and detector
    offset; a Timepix run asks for raw or autoreduce data, autoreduce being
    the loadable one). Folders and TIFF / `.npy` files can be dragged onto the
    window. Files load in parallel; NaN/Inf pixels are zeroed. When the file
    (or folder) names carry a run number (`…_Run_<N>_…`), the detector
    offset is read from that run's NeXus file, unless `-t/--offset` gave one.
-2. **Raw data** view — slide through the images next to the integrated image.
-3. **Correction parameters** (left panel) — the options of
-   `mbirtorch-hsnt denoise`:
+   The panes show the raw images next to the integrated image.
+   **📂 Load settings from HDF5…** re-applies a saved mask and parameters.
+2. **Mask** (optional) — restrict the solve to part of the image. Shapes
+   are drawn on either pane — the raw image (use the Image slider to
+   pick the frame that shows the feature best) or the integrated image;
+   a shape appears on both:
+   - **Rectangle** / **Ellipse**: drag. **Polygon**: click the points, then
+     double-click, press Enter or click the first point to close it (Esc
+     cancels).
+   - **New shapes: include / exclude** — *include* keeps only the pixels
+     inside the include shapes (inside any of them), *exclude* drops the
+     pixels inside.
+   - After a shape is drawn the tool goes back to **Select / move**: click
+     a shape to select it, **drag it to move it**, drag its handles to
+     reshape it (the box of a rectangle or ellipse, the points of a
+     polygon).
+   - **Switch include ↔ exclude at any time**: click the shape's colored
+     mode button in the list, or right-click the shape on the image. ✖ in
+     the list, the Delete key or the right-click menu removes it.
+
+   The panel has one framed block per way of defining the mask, under a
+   summary of how much of the image will be corrected:
+   - **Draw shapes** — above.
+   - **Select by brightness** — keep only the pixels whose value in the
+     integrated image (the sum of all the images, right pane) lies between
+     a **Minimum** and a **Maximum**: raise the minimum to drop the dark
+     surroundings, lower the maximum to drop the open beam around the
+     sample. The status bar gives the value under the cursor.
+   - **Use a mask image** — **📂 Load mask image…** (TIFF or `.npy`,
+     nonzero = kept, read with the stack's detector orientation — e.g. from
+     the Sample / Hyperspectral Masker).
+
+   The parts in use combine (image ∧ brightness ∧ shapes); the pixels left
+   out are shaded dark red on the panes, **💾 Save mask as image…** writes
+   the resulting mask as an 8-bit TIFF, **Clear the mask** goes back to all
+   pixels. Only the selected
+   pixels are written to the exchange file (as a pixels × bins table) and
+   solved; the other pixels keep their raw values in the corrected stack.
+   Note: on a masked run mbirtorch cannot pool neighbouring pixels in its
+   rank estimate, so give the rank when the estimate looks low. The mask is
+   saved with the settings.
+3. **Correct** — the options of `mbirtorch-hsnt denoise`:
    - **Input type** — `transmission` (default: the normalized stacks this tool
      loads), `attenuation` (= −log(transmission)) or `auto` (inferred from the
      values; fails when non-negative values above 1.05 cannot be told apart).
@@ -106,38 +154,25 @@ docstring edits only; its command line, solvers and outputs are the same.
    - **Device** — `auto` (first CUDA GPU, else CPU), `cpu`, `cuda:N`.
    - **Advanced (solver)** — mode `auto|full|stream`, max steps, rel. tol.,
      max passes (stream mode), compile `auto|on|off`.
-4. **Mask** (left panel, optional) — restrict the solve to part of the
-   image: **✏ Draw rectangles** on the integrated image (right pane of the
-   Raw data view; *include* = keep only the pixels inside any include
-   rectangle, *exclude* = drop the pixels inside), keep the pixels whose
-   **integrated value** lies in a range (e.g. leave out the open beam
-   around the sample), and/or **📂 Load mask…** (TIFF or `.npy`, nonzero =
-   selected, read with the stack's detector orientation — e.g. from the
-   Hyperspectral Masker). The sources combine (file ∧ range ∧ rectangles);
-   the excluded pixels are tinted dark red on the panes, the count of
-   selected pixels is shown, **💾 Save mask…** writes the mask as an 8-bit
-   TIFF. Only the selected pixels are written to the exchange file (as a
-   pixels × bins table) and solved; the other pixels keep their raw values
-   in the corrected stack. Note: on a masked run mbirtorch cannot pool
-   neighbouring pixels in its rank estimate, so give the rank when the
-   estimate looks low. The mask is saved with the settings (⚙ Config).
-5. **▶ Perform correction** — runs the CLI on a background thread; the
+
+   **▶ Perform correction** runs the CLI on a background thread; the
    progress bar follows the CLI's log (loading → rank estimate → solve →
    outputs → read-back), **✖ Cancel** kills the Python process. **⚡ Preview**
    runs on 2×2-binned pixels. **📜 Log** (toolbar, or next to the progress
    bar) shows everything the CLI printed; it opens by itself when a run
-   fails.
-6. **Result** section — rank (and how it was obtained), solve mode / steps /
-   time / loss, reduced chi-square with the CLI's verdict (or the relative
-   residual when no dose was given), the CLI's warnings. **📈 Diagnostics**
-   shows the component spectra and maps plots, the data checks and the
-   memory plan.
-7. **Corrected vs raw** and **Profiles** views
-   (shared contrast, difference pane, region + single-pixel profiles,
-   TOF / wavelength axes from `*_Spectra.txt`, detector offset, CSV export).
-   The profile series have fixed colors — uncorrected orange ✕, corrected
-   blue ● — and the marker glyph is in the legend text.
-8. **💾 Export corrected images…** — 32-bit float TIFFs (input names kept) in
+   fails. When the run is done the window moves on to the next step.
+4. **Review** — the result: rank (and how it was obtained), solve mode /
+   steps / time / loss, reduced chi-square with the CLI's verdict (or the
+   relative residual when no dose was given), the CLI's warnings. **Look
+   at** switches the panes between **Corrected vs raw** (right pane: raw or
+   the difference), **Profiles** (region + single-pixel profiles, TOF /
+   wavelength axes from `*_Spectra.txt`, detector offset, CSV export; the
+   series have fixed colors — uncorrected orange ✕, corrected blue ● — and
+   the marker glyph is in the legend text) and the raw data.
+   **📈 Diagnostics** shows the component spectra and maps plots, the data
+   checks and the memory plan.
+5. **Export** — **💾 Export corrected images…** writes 32-bit float TIFFs
+   (input names kept) in
    `dehydrated_hydrated_<input-folder>[_N]`, plus a copy of the input
    folder's `*_Spectra.txt` (so the TOF axis follows the corrected stack),
    `correction_config.json` (parameters, CLI arguments, mbirtorch commit, the
@@ -146,10 +181,15 @@ docstring edits only; its command line, solvers and outputs are the same.
    `mean_pixel_spectrum`), `hsnt_spectra.png`, `hsnt_maps.png`,
    `hsnt_log.txt`, the component maps as images `hsnt_map_<i>.tif`
    (float32, 0 outside the mask) and, for a masked run, `mask.tif`.
+   **💾 Save settings to HDF5…** is here too.
 
-**⚙ Config** saves / loads the settings as an HDF5 file (format version 2:
+The settings file (saved in the Export step, loaded in the Load data step)
+is HDF5, format version 2:
 `/correction` holds `input_type`, `rank`, `max_rank`, `spectra`, `dose`,
-`device`, `mode`, `max_steps`, `rel_tol`, `max_passes`, `compile`). A
+`device`, `mode`, `max_steps`, `rel_tol`, `max_passes`, `compile`; `/mask`
+holds the range, the mask file path and the drawn shapes (`@shapes`, a JSON
+list of rectangles, ellipses and polygons; the rectangles are also written
+as the `rects` table older versions read). A
 version-1 file of the former NMF tool still loads: its `dataset_type`
 becomes the input type and its `num_materials` the (fixed) rank.
 
@@ -166,7 +206,9 @@ relayed on stderr, indented; the created folder is printed on stdout).
 `--bin N` runs spatially binned, `--run-number N` can replace the INPUT path,
 `--detector` forces the orientation. The mask: `--mask FILE`,
 `--mask-include x0,y0,x1,y1` / `--mask-exclude x0,y0,x1,y1` (repeatable,
-half-open pixel bounds in the oriented frame) and `--mask-range LO:HI` on
+half-open pixel bounds in the oriented frame), their ellipse and polygon
+forms `--mask-include-ellipse cx,cy,rx,ry`, `--mask-include-polygon
+x0,y0,x1,y1,x2,y2,…` (and `--mask-exclude-…`), and `--mask-range LO:HI` on
 the integrated image. For scripts written against the
 former NMF tool, `--materials N` works unchanged (`--rank` is the hsnt
 synonym), `--dataset-type` means
@@ -210,7 +252,7 @@ timestamped line per event; the file is readable in the Log Browser
   bins) table and comes back into the raw frames), the subprocess with live
   log relay, stage detection from the log lines, cancel (kill), the report
   parser, the component maps read from the dehydrated file.
-- `src/mask.rs`: the mask definition (rectangles, integrated-value range,
+- `src/mask.rs`: the mask definition (shapes — rectangles, ellipses, polygons —, integrated-value range,
   mask file) and its evaluation, binning for previews, TIFF read/write with
   the detector orientation.
 - `src/correction.rs`: the GUI-independent run (binning for previews,

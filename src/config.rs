@@ -25,8 +25,13 @@
 //!                      @range_lo, @range_hi (f64) when the integrated-value
 //!                      range is set; @file (path of a mask image) when one
 //!                      was loaded (re-read on load, when it still exists);
-//!                      dataset rects (n × 5 u64: left, right, top, bottom,
-//!                      mode 0 = include / 1 = exclude)
+//!                      @shapes (JSON list of the drawn shapes —
+//!                      rectangles, ellipses, polygons —, see
+//!                      `mask::shapes_to_json`); dataset rects (n × 5 u64:
+//!                      left, right, top, bottom, mode 0 = include /
+//!                      1 = exclude): the rectangles again, for the readers
+//!                      that predate @shapes (it is read when @shapes is
+//!                      absent)
 //! ```
 //!
 //! Format version 2 (this beta). A version-1 file of the production tool
@@ -42,7 +47,7 @@
 use crate::colormap::Colormap;
 use crate::correction::CorrectionParams;
 use crate::hsnt_cli::{Compile, Device, InputType, Rank, SolveMode, Spectra};
-use crate::mask::{MaskRect, RectMode};
+use crate::mask::{self, Geom, MaskRect, MaskShape, RectMode};
 use crate::spectra;
 use anyhow::{bail, Context, Result};
 use hdf5::types::VarLenUnicode;
@@ -69,8 +74,8 @@ pub struct AppConfig {
     /// Folder the settings were tuned on — recorded for reference, not
     /// applied on load.
     pub input_folder: Option<PathBuf>,
-    /// The mask definition: rectangles, integrated-value range, mask file.
-    pub mask_rects: Vec<MaskRect>,
+    /// The mask definition: drawn shapes, integrated-value range, mask file.
+    pub mask_shapes: Vec<MaskShape>,
     pub mask_range: Option<(f32, f32)>,
     pub mask_file: Option<PathBuf>,
 }
@@ -88,7 +93,7 @@ impl Default for AppConfig {
             vmax: 1.0,
             region: None,
             input_folder: None,
-            mask_rects: Vec::new(),
+            mask_shapes: Vec::new(),
             mask_range: None,
             mask_file: None,
         }
@@ -141,7 +146,7 @@ pub fn save(path: &Path, cfg: &AppConfig) -> Result<()> {
         write_u64(&g, "bottom", bottom as u64)?;
     }
 
-    if !cfg.mask_rects.is_empty() || cfg.mask_range.is_some() || cfg.mask_file.is_some() {
+    if !cfg.mask_shapes.is_empty() || cfg.mask_range.is_some() || cfg.mask_file.is_some() {
         let g = file.create_group("mask")?;
         if let Some((lo, hi)) = cfg.mask_range {
             write_f64(&g, "range_lo", lo as f64)?;
@@ -150,14 +155,26 @@ pub fn save(path: &Path, cfg: &AppConfig) -> Result<()> {
         if let Some(path) = &cfg.mask_file {
             write_str(&g, "file", &path.display().to_string())?;
         }
-        if !cfg.mask_rects.is_empty() {
-            let mut rects = ndarray::Array2::<u64>::zeros((cfg.mask_rects.len(), 5));
-            for (i, r) in cfg.mask_rects.iter().enumerate() {
-                rects[(i, 0)] = r.left as u64;
-                rects[(i, 1)] = r.right as u64;
-                rects[(i, 2)] = r.top as u64;
-                rects[(i, 3)] = r.bottom as u64;
-                rects[(i, 4)] = (r.mode == RectMode::Exclude) as u64;
+        if !cfg.mask_shapes.is_empty() {
+            write_str(&g, "shapes", &mask::shapes_to_json(&cfg.mask_shapes))?;
+        }
+        // The rectangles once more, as the table older readers know.
+        let boxes: Vec<([f32; 4], RectMode)> = cfg
+            .mask_shapes
+            .iter()
+            .filter_map(|s| match s.geom {
+                Geom::Rect(_) => Some((s.bbox(), s.mode)),
+                _ => None,
+            })
+            .collect();
+        if !boxes.is_empty() {
+            let mut rects = ndarray::Array2::<u64>::zeros((boxes.len(), 5));
+            for (i, (b, mode)) in boxes.iter().enumerate() {
+                rects[(i, 0)] = b[0].max(0.0).round() as u64;
+                rects[(i, 1)] = b[2].max(0.0).round() as u64;
+                rects[(i, 2)] = b[1].max(0.0).round() as u64;
+                rects[(i, 3)] = b[3].max(0.0).round() as u64;
+                rects[(i, 4)] = (*mode == RectMode::Exclude) as u64;
             }
             g.new_dataset_builder().with_data(&rects).create("rects")?;
         }
@@ -273,7 +290,9 @@ pub fn load(path: &Path) -> Result<AppConfig> {
             cfg.mask_range = Some((lo as f32, hi as f32));
         }
         cfg.mask_file = read_str(&g, "file").map(PathBuf::from);
-        if let Ok(ds) = g.dataset("rects") {
+        if let Some(json) = read_str(&g, "shapes") {
+            cfg.mask_shapes = mask::shapes_from_json(&json)?;
+        } else if let Ok(ds) = g.dataset("rects") {
             let rects = ds.read_2d::<u64>().context("read the mask rectangles")?;
             if rects.ncols() != 5 {
                 bail!("mask rectangles have {} columns, expected 5", rects.ncols());
@@ -281,13 +300,16 @@ pub fn load(path: &Path) -> Result<AppConfig> {
             for row in rects.rows() {
                 let (l, r, t, b) = (row[0] as usize, row[1] as usize, row[2] as usize, row[3] as usize);
                 if l < r && t < b {
-                    cfg.mask_rects.push(MaskRect {
-                        left: l,
-                        right: r,
-                        top: t,
-                        bottom: b,
-                        mode: if row[4] == 0 { RectMode::Include } else { RectMode::Exclude },
-                    });
+                    cfg.mask_shapes.push(
+                        MaskRect {
+                            left: l,
+                            right: r,
+                            top: t,
+                            bottom: b,
+                            mode: if row[4] == 0 { RectMode::Include } else { RectMode::Exclude },
+                        }
+                        .into(),
+                    );
                 }
             }
         }
@@ -372,9 +394,11 @@ mod tests {
             vmax: 1.75,
             region: Some([10, 200, 20, 180]),
             input_folder: Some(PathBuf::from("/some/data/folder")),
-            mask_rects: vec![
-                MaskRect { left: 1, right: 9, top: 2, bottom: 8, mode: RectMode::Include },
-                MaskRect { left: 3, right: 4, top: 3, bottom: 4, mode: RectMode::Exclude },
+            mask_shapes: vec![
+                MaskRect { left: 1, right: 9, top: 2, bottom: 8, mode: RectMode::Include }.into(),
+                MaskRect { left: 3, right: 4, top: 3, bottom: 4, mode: RectMode::Exclude }.into(),
+                MaskShape::parse_ellipse("20.5,10,4,3", RectMode::Exclude).unwrap(),
+                MaskShape::parse_polygon("0,0,12,1,5,9.5", RectMode::Include).unwrap(),
             ],
             mask_range: Some((0.5, 1.5)),
             mask_file: Some(PathBuf::from("/some/mask.tif")),
@@ -395,7 +419,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(loaded, cfg);
         assert!(loaded.region.is_none());
-        assert!(loaded.mask_rects.is_empty() && loaded.mask_range.is_none() && loaded.mask_file.is_none());
+        assert!(loaded.mask_shapes.is_empty() && loaded.mask_range.is_none() && loaded.mask_file.is_none());
         assert_eq!(loaded.params.rank, Rank::Auto);
         assert!(loaded.params.dose.is_none());
     }
