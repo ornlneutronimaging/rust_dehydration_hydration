@@ -417,6 +417,8 @@ pub struct DehydrationApp {
     ipts_scan: Option<Receiver<Vec<u32>>>,
     ipts_filter: String,
 
+    /// The "? Tutorial" window (a second process of this binary).
+    help: crate::help::Help,
     /// Current step of the workflow (what the left panel shows).
     step: Step,
     view: View,
@@ -553,6 +555,7 @@ impl DehydrationApp {
             ipts_list: None,
             ipts_scan: None,
             ipts_filter: String::new(),
+            help: crate::help::Help::default(),
             step: Step::Data,
             view: View::Raw,
             frame_idx: 0,
@@ -3356,6 +3359,27 @@ impl DehydrationApp {
     /// current one highlighted. Click a step to open it.
     fn step_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(3.0);
+        ui.horizontal(|ui| {
+          ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Far right: the tutorial; the steps flow in from the left.
+            if ui
+                .button(egui::RichText::new("? Tutorial").strong())
+                .on_hover_text("How to use the tool, step by step, with drawings (opens in its own window)")
+                .clicked()
+            {
+                match self.help.launch() {
+                    Ok(true) => logger::log("Tutorial opened"),
+                    Ok(false) => {
+                        logger::log("Tutorial already open");
+                        self.status = "The tutorial window is already open.".to_owned();
+                    }
+                    Err(e) => {
+                        self.status = format!("The tutorial window failed to start: {e}");
+                        logger::error(&self.status);
+                    }
+                }
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let mut go = None;
@@ -3379,6 +3403,9 @@ impl DehydrationApp {
             if let Some(step) = go {
                 self.set_step(step);
             }
+        });
+            });
+          });
         });
         ui.add_space(3.0);
     }
@@ -3760,7 +3787,7 @@ impl DehydrationApp {
                         .weak(),
                 )
                 .on_hover_text(
-                    "Last line of the mbirtorch log (📜 Log in the toolbar shows all of it)",
+                    "Last line of the mbirtorch log (📜 Log below shows all of it)",
                 );
             }
             ui.horizontal(|ui| {
@@ -3817,6 +3844,7 @@ impl DehydrationApp {
 
     /// Step 4: what the correction found, and what to look at.
     fn step_review(&mut self, ui: &mut egui::Ui) {
+        let mut open_log = false;
         if let Some(result) = &self.result {
             if result.is_preview() {
                 ui.heading(format!("Result — PREVIEW ({0}×{0} binned)", result.bin));
@@ -3875,11 +3903,24 @@ impl DehydrationApp {
                 }
             }
             if !r.warnings.is_empty() {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("{} warning(s) from mbirtorch — see 📜 Log", r.warnings.len()),
-                )
-                .on_hover_text(r.warnings.join("\n"));
+                // A link: one click opens the log, the warnings listed first.
+                let color = ui.visuals().warn_fg_color;
+                if ui
+                    .link(
+                        egui::RichText::new(format!(
+                            "⚠ {} warning(s) from mbirtorch — show the log",
+                            r.warnings.len()
+                        ))
+                        .color(color),
+                    )
+                    .on_hover_text(format!(
+                        "Click to open the mbirtorch log, the warnings listed first:\n\n{}",
+                        r.warnings.join("\n")
+                    ))
+                    .clicked()
+                {
+                    open_log = true;
+                }
             }
             ui.label(format!(
                 "{} · spectra {} · device {}",
@@ -3906,6 +3947,10 @@ impl DehydrationApp {
         } else {
             ui.label("Run the correction first.");
             return;
+        }
+        if open_log {
+            logger::log("Warnings link clicked: log window opened");
+            self.show_log = true;
         }
 
         ui.add_space(8.0);
@@ -4461,7 +4506,7 @@ impl DehydrationApp {
                     // entry, so the legend cannot be read the wrong way round.
                     plot.show(ui, |plot_ui| {
                         plot_ui.points(
-                            Points::new("Uncorrected profile  ✕", uncorr)
+                            Points::new("Uncorrected profile  ×", uncorr)
                                 .shape(MarkerShape::Cross)
                                 .color(UNCORRECTED_COLOR)
                                 .radius(3.0),

@@ -11,6 +11,7 @@ pub mod colormap;
 pub mod config;
 pub mod correction;
 pub mod export;
+pub mod help;
 pub mod hsnt_cli;
 pub mod loader;
 pub mod logger;

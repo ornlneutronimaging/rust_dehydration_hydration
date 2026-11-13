@@ -4,7 +4,7 @@
 use dehydration_hydration::theme;
 
 /// Arrows and subscripts from the labels, plus every toolbar/button icon.
-const UI_GLYPHS: &str = "→₁₀×µÅλ−≈·—–…☀🌙📁📂🕒🔍⚙💾✖▶◀✔⚡⏳📄ℹ📈📜";
+const UI_GLYPHS: &str = "→₁₀×µÅλ−≈·—–…☀🌙📁📂🕒🔍⚙💾✖▶◀✔⚡⏳📄ℹ📈📜⚠Σ▫↔●";
 
 /// egui's replacement character (drawn for glyphs no font has).
 const REPLACEMENT: char = '◻';

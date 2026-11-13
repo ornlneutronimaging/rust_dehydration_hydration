@@ -12,6 +12,7 @@ use dehydration_hydration::correction::{run_correction, CorrectionParams};
 use dehydration_hydration::export::{export_corrected, Provenance};
 use dehydration_hydration::hsnt_cli::{self, Compile, Device, InputType, Rank, SolveMode, Spectra};
 use dehydration_hydration::export::MaskInfo;
+use dehydration_hydration::help;
 use dehydration_hydration::loader;
 use dehydration_hydration::logger;
 use dehydration_hydration::mask::{MaskRect, MaskShape, MaskSpec, RectMode};
@@ -120,6 +121,8 @@ OPTIONS:
                            images/ikonxl, …); the toolbar has a combobox.
                            Exported images are always written back in the
                            on-disk orientation of the input
+  --instructions           Show only the step-by-step tutorial window (what the
+                           ? Tutorial button opens)
   -h, --help               Show this help
 
 ENVIRONMENT:
@@ -572,6 +575,32 @@ fn main() -> eframe::Result<()> {
         logger::error(format!("PANIC: {info}"));
         default_hook(info);
     }));
+
+    // The step-by-step tutorial: a window of its own, run by a second
+    // process of this binary (see `help`).
+    if argv.first().is_some_and(|a| a == help::INSTRUCTIONS_FLAG) {
+        let native_options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size(help::HelpWindow::SIZE)
+                .with_title(help::HelpWindow::TITLE),
+            ..Default::default()
+        };
+        let result = eframe::run_native(
+            help::HelpWindow::TITLE,
+            native_options,
+            Box::new(|cc| {
+                cc.egui_ctx.set_theme(dehydration_hydration::theme::load());
+                dehydration_hydration::theme::install_fonts(&cc.egui_ctx);
+                cc.egui_ctx.set_zoom_factor(dehydration_hydration::zoom::load());
+                Ok(Box::new(help::HelpWindow::default()))
+            }),
+        );
+        match &result {
+            Ok(()) => logger::log("Tutorial window closed"),
+            Err(e) => logger::error(format!("Tutorial window failed: {e}")),
+        }
+        return result;
+    }
 
     let cli = match parse_args() {
         Ok(cli) => cli,

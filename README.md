@@ -89,6 +89,11 @@ yet (no data, no result) is greyed out and says what is missing. The toolbar
 under the step bar only sets what the image panes show: view, image,
 contrast, colormap, zoom.
 
+**? Tutorial** (right end of the step bar) opens an illustrated, step-by-step
+tutorial in a window of its own — one page per step, with a drawing and the
+instructions — that can stay open next to the tool while the steps are
+followed (`dehydration_hydration --instructions` shows it alone).
+
 1. **Load data** — **Open Folder…** / **Open Files…** / **🕒 Recent** / **🔍 Run number…**
    (`-r/--run-number N`, NeXus lookup: detector, image folder and detector
    offset; a Timepix run asks for raw or autoreduce data, autoreduce being
@@ -163,11 +168,12 @@ contrast, colormap, zoom.
    fails. When the run is done the window moves on to the next step.
 4. **Review** — the result: rank (and how it was obtained), solve mode /
    steps / time / loss, reduced chi-square with the CLI's verdict (or the
-   relative residual when no dose was given), the CLI's warnings. **Look
+   relative residual when no dose was given), the CLI's warnings (the
+   warnings line is a link: one click opens the log, the warnings first). **Look
    at** switches the panes between **Corrected vs raw** (right pane: raw or
    the difference), **Profiles** (region + single-pixel profiles, TOF /
    wavelength axes from `*_Spectra.txt`, detector offset, CSV export; the
-   series have fixed colors — uncorrected orange ✕, corrected blue ● — and
+   series have fixed colors — uncorrected orange ×, corrected blue ● — and
    the marker glyph is in the legend text) and the raw data.
    **📈 Diagnostics** shows the component spectra and maps plots, the data
    checks and the memory plan.
@@ -252,6 +258,8 @@ timestamped line per event; the file is readable in the Log Browser
   bins) table and comes back into the raw frames), the subprocess with live
   log relay, stage detection from the log lines, cancel (kill), the report
   parser, the component maps read from the dehydrated file.
+- `src/help.rs`: the illustrated tutorial window (drawings painted with
+  egui), a second process of the binary (`--instructions`).
 - `src/mask.rs`: the mask definition (shapes — rectangles, ellipses, polygons —, integrated-value range,
   mask file) and its evaluation, binning for previews, TIFF read/write with
   the detector orientation.
