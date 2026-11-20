@@ -3362,8 +3362,7 @@ impl DehydrationApp {
         ui.horizontal(|ui| {
           ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Far right: the tutorial; the steps flow in from the left.
-            if ui
-                .button(egui::RichText::new("? Tutorial").strong())
+            if crate::tutorial_button::show(ui, "Tutorial", false)
                 .on_hover_text("How to use the tool, step by step, with drawings (opens in its own window)")
                 .clicked()
             {

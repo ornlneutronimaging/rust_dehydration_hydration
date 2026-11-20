@@ -20,5 +20,6 @@ pub mod recent;
 pub mod run_lookup;
 pub mod spectra;
 pub mod theme;
+pub mod tutorial_button;
 pub mod variant;
 pub mod zoom;
