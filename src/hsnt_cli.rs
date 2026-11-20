@@ -386,6 +386,31 @@ impl HsntParams {
     }
 
     /// One-line human summary (status bar, logs).
+    /// The parameters as the options of this tool's command line
+    /// (`--input-type transmission --materials auto …`): what a calling
+    /// application keeps to run the same correction again without a window.
+    pub fn cli_options(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut put = |name: &str, value: String| {
+            out.push(name.to_owned());
+            out.push(value);
+        };
+        put("--input-type", self.input_type.label().to_owned());
+        put("--materials", self.rank.label());
+        put("--max-rank", self.max_rank.to_string());
+        put("--spectra", self.spectra.label().to_owned());
+        if let Some(dose) = self.dose {
+            put("--dose", dose.to_string());
+        }
+        put("--device", self.device.label());
+        put("--mode", self.mode.label().to_owned());
+        put("--max-steps", self.max_steps.to_string());
+        put("--rel-tol", self.rel_tol.to_string());
+        put("--max-passes", self.max_passes.to_string());
+        put("--compile", self.compile.label().to_owned());
+        out
+    }
+
     pub fn summary(&self) -> String {
         let mut s = format!(
             "{} data, rank {}, spectra {}, device {}, {} solve",

@@ -222,6 +222,30 @@ synonym), `--dataset-type` means
 `--safety-factor` are accepted and ignored with a warning — so the Workflow
 Runner can be pointed at this binary with `WORKFLOW_DEHY_BIN`.
 
+## Opened from another application
+
+`--called-from-app`, with the INPUT folder and `--output DIR` (or
+`--export-dir DIR`), is how another application — iBeatles 2.0 — opens this
+window to get the corrected stack back:
+
+    ./launch_dehydration_hydration.sh /path/to/normalized \
+        --called-from-app --export-dir /path/to/output/denoised \
+        --mask /path/to/mask.tif [correction options]
+
+A banner says so at the top of the window, `--mask` is the mask the stack
+starts with, and the Export step gets an **↩ Export & return to main
+application** button: it writes the corrected stack in a new subfolder of
+`DIR` (no dialog), prints one JSON line on the standard output and closes the
+window:
+
+    {"dehydrated_dir": "<folder written>", "n_images": 2785,
+     "config": "<folder>/correction_config.json",
+     "options": ["--input-type", "transmission", "--materials", "auto", …]}
+
+`options` are the correction parameters as this command line takes them, so
+the caller can run the same correction again with `--run`. Closing the window
+any other way hands nothing back.
+
 ## Build & run
 
 ```bash

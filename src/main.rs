@@ -52,7 +52,17 @@ OPTIONS:
                            corrected stack without opening a window
                            (requires INPUT or --run-number, and --output)
   -o, --output <DIR>       Folder receiving the corrected subfolder
-                           'dehydrated_hydrated_<input>'
+                           'dehydrated_hydrated_<input>' (--export-dir is a
+                           synonym, for calling applications)
+  --called-from-app        Opened by another application, with INPUT and
+                           --output: the Export step gets an “Export & return
+                           to main application” button, which writes the
+                           corrected stack under --output, prints one JSON
+                           line on the standard output — {\"dehydrated_dir\":
+                           the folder written, \"n_images\", \"config\",
+                           \"options\": the correction options as this command
+                           line takes them} — and closes the window. Closing
+                           the window without it hands nothing back
 
   Correction (the options of `mbirtorch-hsnt denoise`):
   --input-type <TYPE>      What the values are: transmission (default — the
@@ -88,7 +98,9 @@ OPTIONS:
   Mask (only the selected pixels are sent to mbirtorch; the others keep
   their raw values in the corrected stack; all pixels when no mask option):
   --mask <FILE>            Mask image (TIFF or .npy, nonzero = selected), read
-                           with the stack's detector orientation
+                           with the stack's detector orientation. In the
+                           window it is the mask the INPUT stack starts with
+                           (the other mask options are for --run only)
   --mask-include <x0,y0,x1,y1>
                            Keep only the pixels inside this rectangle
                            (half-open pixel bounds). The include options are
@@ -155,6 +167,8 @@ struct Cli {
     mask_file: Option<PathBuf>,
     mask_shapes: Vec<MaskShape>,
     mask_range: Option<(f32, f32)>,
+    /// `--called-from-app`: hand the corrected stack back to the caller.
+    called_from_app: bool,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -171,6 +185,7 @@ fn parse_args() -> Result<Cli, String> {
         mask_file: None,
         mask_shapes: Vec::new(),
         mask_range: None,
+        called_from_app: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -201,7 +216,8 @@ fn parse_args() -> Result<Cli, String> {
                     _ => return Err(format!("invalid --ipts '{v}': expected a number or IPTS-<number>")),
                 };
             }
-            "-o" | "--output" => cli.output = Some(PathBuf::from(value("--output")?)),
+            "-o" | "--output" | "--export-dir" | "--export_dir" => cli.output = Some(PathBuf::from(value("--output")?)),
+            "--called-from-app" | "--called_from_app" => cli.called_from_app = true,
             "--input-type" | "--input_type" | "--dataset-type" | "--dataset_type" => {
                 let v = value("--input-type")?;
                 cli.params.input_type = InputType::parse(&v)
@@ -344,6 +360,14 @@ fn parse_args() -> Result<Cli, String> {
         }
         if cli.output.is_none() {
             return Err("--run requires --output <DIR>".to_owned());
+        }
+    }
+    if cli.called_from_app && !cli.run {
+        if cli.inputs.is_empty() {
+            return Err("--called-from-app requires the INPUT folder or files to correct".to_owned());
+        }
+        if cli.output.is_none() {
+            return Err("--called-from-app requires --output <DIR> (or --export-dir): where the corrected stack is handed back".to_owned());
         }
     }
     Ok(cli)
@@ -616,6 +640,8 @@ fn main() -> eframe::Result<()> {
     let run_number = cli.run_number;
     let ipts = cli.ipts;
     let params = cli.params;
+    let handback = cli.called_from_app.then(|| cli.output.clone()).flatten();
+    let startup_mask = cli.mask_file.clone();
 
     if cli.run {
         if let Err(e) = run_headless(&cli, files) {
@@ -653,6 +679,12 @@ fn main() -> eframe::Result<()> {
             app.set_detector_override(detector);
             app.set_ipts(ipts);
             app.set_params(params);
+            if let Some(dir) = handback {
+                app.set_called_from_app(dir);
+            }
+            if let Some(mask) = startup_mask {
+                app.set_startup_mask(mask);
+            }
             if !files.is_empty() {
                 app.start_load(files, &cc.egui_ctx);
             }

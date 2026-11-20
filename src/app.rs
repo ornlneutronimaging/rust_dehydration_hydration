@@ -440,6 +440,15 @@ pub struct DehydrationApp {
     corr_job: Option<CorrJob>,
     export_job: Option<ExportJob>,
     last_export: Option<PathBuf>,
+    /// Opened by another application (`--called-from-app`): where the
+    /// corrected stack is written for it.
+    handback_dir: Option<PathBuf>,
+    /// The export under way is the one handed back: when it is written, its
+    /// folder is printed for the calling application and the window closes.
+    handback_export: bool,
+    close_now: bool,
+    /// `--mask`: the mask image applied to the stack given at startup.
+    startup_mask: Option<PathBuf>,
     /// Every line the mbirtorch command line printed during the last (or
     /// running) correction, shown by the "📜 Log" window.
     run_log: Vec<String>,
@@ -571,6 +580,10 @@ impl DehydrationApp {
             corr_job: None,
             export_job: None,
             last_export: None,
+            handback_dir: None,
+            handback_export: false,
+            close_now: false,
+            startup_mask: None,
             run_log: Vec::new(),
             show_log: false,
             show_diagnostics: false,
@@ -627,6 +640,18 @@ impl DehydrationApp {
     }
 
     /// Correction parameters given on the command line.
+    /// `--called-from-app`: another application opened this window to get
+    /// the corrected stack back, written under `export_dir`.
+    pub fn set_called_from_app(&mut self, export_dir: PathBuf) {
+        logger::log(format!("Called from another application: the corrected stack goes to {}", export_dir.display()));
+        self.handback_dir = Some(export_dir);
+    }
+
+    /// `--mask`: the mask image to apply to the stack given at startup.
+    pub fn set_startup_mask(&mut self, path: PathBuf) {
+        self.startup_mask = Some(path);
+    }
+
     pub fn set_params(&mut self, params: CorrectionParams) {
         self.params = params;
         if let Rank::Fixed(n) = params.rank {
@@ -1845,6 +1870,18 @@ impl DehydrationApp {
             self.x_axis = XAxis::Index;
         }
 
+        // The mask given on the command line, for the stack given with it.
+        if let Some(path) = self.startup_mask.take() {
+            match mask::load_file(&path, stack.detector) {
+                Ok(pixels) => {
+                    logger::log(format!("Mask of the command line loaded from {} ({} selected pixel(s))", path.display(), mask::count(&pixels)));
+                    self.mask_spec.file = Some(MaskFile { path, pixels: Arc::new(pixels) });
+                    self.mask_dirty = true;
+                }
+                Err(e) => logger::error(format!("Loading the mask {} failed: {e:#}", path.display())),
+            }
+        }
+
         self.stack = Some(Arc::new(stack));
         self.result = None;
         self.profiles = None;
@@ -2031,14 +2068,12 @@ impl DehydrationApp {
 
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.result else { return };
-        let Some(stack) = &self.stack else { return };
         if result.is_preview() {
             self.status =
                 "Preview results are binned — run the full correction before exporting.".to_owned();
             logger::warn(&self.status);
             return;
         }
-        let input_dir = self.input_dir.clone().unwrap_or_default();
         let mut dialog = rfd::FileDialog::new()
             .set_title("Choose the folder that will receive the corrected images");
         if let Some(parent) = self.input_dir.as_ref().and_then(|p| p.parent()) {
@@ -2048,6 +2083,28 @@ impl DehydrationApp {
             logger::log("Export: dialog cancelled");
             return;
         };
+        self.export_to(output_dir, ctx);
+    }
+
+    /// Hand the corrected stack back to the application that opened this
+    /// window: written under the folder it gave, then announced to it.
+    fn export_and_return(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.handback_dir.clone() else { return };
+        self.export_to(dir, ctx);
+        self.handback_export = self.export_job.is_some();
+    }
+
+    /// Write the corrected stack in a new subfolder of `output_dir`.
+    fn export_to(&mut self, output_dir: PathBuf, ctx: &egui::Context) {
+        let Some(result) = &self.result else { return };
+        let Some(stack) = &self.stack else { return };
+        if result.is_preview() {
+            self.status =
+                "Preview results are binned — run the full correction before exporting.".to_owned();
+            logger::warn(&self.status);
+            return;
+        }
+        let input_dir = self.input_dir.clone().unwrap_or_default();
         let (h, w) = result.dims();
         logger::log(format!(
             "Exporting {} corrected image(s) ({}×{} px, {} artifact file(s)) to {} (input folder {})",
@@ -2162,9 +2219,29 @@ impl DehydrationApp {
             Ok(folder) => {
                 self.status = format!("Corrected images exported to {}", folder.display());
                 logger::log(&self.status);
+                if std::mem::take(&mut self.handback_export) {
+                    // The hand-back: one JSON line on the standard output,
+                    // read by the calling application, then the window closes.
+                    let (n_images, options) = match &self.result {
+                        Some(r) => (r.frames.len(), r.params.cli_options()),
+                        None => (0, Vec::new()),
+                    };
+                    let doc = serde_json::json!({
+                        "dehydrated_dir": folder,
+                        "n_images": n_images,
+                        "config": folder.join("correction_config.json"),
+                        "options": options,
+                    });
+                    println!("{doc}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    logger::log(format!("Handed back to the calling application: {doc}"));
+                    self.close_now = true;
+                }
                 self.last_export = Some(folder);
             }
             Err(e) => {
+                self.handback_export = false;
                 self.status = format!("Export failed: {e}");
                 logger::error(&self.status);
             }
@@ -4046,6 +4123,25 @@ impl DehydrationApp {
                 );
             } else {
                 let exportable = !result.is_preview();
+                // Opened by another application: one click writes the stack
+                // where it expects it and goes back to it.
+                if let Some(dir) = self.handback_dir.clone() {
+                    let text = egui::RichText::new("↩ Export & return to main application").size(15.0).strong().color(egui::Color32::WHITE);
+                    let button = egui::Button::new(text).fill(egui::Color32::from_rgb(40, 120, 200)).min_size(egui::vec2(ui.available_width(), 34.0));
+                    if ui
+                        .add_enabled(exportable, button)
+                        .on_hover_text(format!(
+                            "Writes the corrected stack in a new subfolder of {} and hands it back to the application that opened this window, which closes",
+                            dir.display()
+                        ))
+                        .on_disabled_hover_text("Preview results are binned — run the full correction first")
+                        .clicked()
+                    {
+                        self.export_and_return(&ctx);
+                    }
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Or keep a copy somewhere else:").small().weak());
+                }
                 if ui
                     .add_enabled(exportable, egui::Button::new("💾 Export corrected images…"))
                     .on_hover_text(
@@ -5067,6 +5163,22 @@ impl eframe::App for DehydrationApp {
         self.ensure_textures(&ctx);
         self.handle_drops(&ctx);
 
+        if self.close_now {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if let Some(dir) = &self.handback_dir {
+            egui::Panel::top("handback").show(ui, |ui| {
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("↩ Opened from another application").strong().color(egui::Color32::from_rgb(90, 160, 240)));
+                    ui.label(format!(
+                        "Run the correction, then click “Export & return to main application” in the Export step: the corrected images are written in {} and handed back.",
+                        dir.display()
+                    ));
+                });
+                ui.add_space(3.0);
+            });
+        }
         egui::Panel::top("steps").show(ui, |ui| {
             self.step_bar(ui);
         });
