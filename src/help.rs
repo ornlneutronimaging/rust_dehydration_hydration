@@ -67,6 +67,10 @@ impl Help {
         {
             return Ok(false);
         }
+        // A replay does not start the window the session started.
+        if !crate::replay::starts_programs() {
+            return Ok(true);
+        }
         let exe = std::env::current_exe().map_err(|e| format!("cannot find the executable: {e}"))?;
         let child = std::process::Command::new(&exe)
             .arg(INSTRUCTIONS_FLAG)

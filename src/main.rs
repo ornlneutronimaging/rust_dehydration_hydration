@@ -16,6 +16,7 @@ use dehydration_hydration::help;
 use dehydration_hydration::loader;
 use dehydration_hydration::logger;
 use dehydration_hydration::mask::{MaskRect, MaskShape, MaskSpec, RectMode};
+use dehydration_hydration::privacy;
 use dehydration_hydration::run_lookup;
 use dehydration_hydration::variant;
 use std::path::PathBuf;
@@ -135,6 +136,24 @@ OPTIONS:
                            on-disk orientation of the input
   --instructions           Show only the step-by-step tutorial window (what the
                            ? Tutorial button opens)
+  --no-session-log         Do not record this session. By default what is
+                           done in the window (pointer, clicks, keys, file
+                           dialogs, log lines) is recorded to
+                           /SNS/VENUS/shared/log/sessions, so a problem can
+                           be reproduced with the Session Replay tool
+                           (VENUS_SESSION_LOG=0 does the same; --run and
+                           --instructions are never recorded). In the window,
+                           the 🔒 button turns the recording off for good
+                           (and deletes the session being recorded) until it
+                           is turned on again
+  --replay <FILE>          Replay a recorded session: the tool starts with the
+                           command line of that session and redoes what its
+                           user did, writing under /tmp/session_replay_<you>/
+                           instead of where the session wrote. Driven by the
+                           Session Replay tool, or by typing play / pause /
+                           step / speed <x|max> / goto <input> / quit in the
+                           terminal
+  --replay-paused          With --replay: start paused
   -h, --help               Show this help
 
 ENVIRONMENT:
@@ -171,7 +190,7 @@ struct Cli {
     called_from_app: bool,
 }
 
-fn parse_args() -> Result<Cli, String> {
+fn parse_args(argv: Vec<String>) -> Result<Cli, String> {
     let mut cli = Cli {
         inputs: Vec::new(),
         run: false,
@@ -187,7 +206,7 @@ fn parse_args() -> Result<Cli, String> {
         mask_range: None,
         called_from_app: false,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
             args.next()
@@ -569,6 +588,41 @@ fn run_headless(cli: &Cli, mut files: Vec<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The options of the session log, taken out of the command line: the rest
+/// is what a replay starts the tool with.
+struct SessionArgs {
+    replay: Option<PathBuf>,
+    paused: bool,
+    record: bool,
+}
+
+fn split_session_args(args: Vec<String>) -> Result<(Vec<String>, SessionArgs), String> {
+    let mut session = SessionArgs {
+        replay: None,
+        paused: false,
+        record: std::env::var("VENUS_SESSION_LOG").map(|v| v != "0").unwrap_or(true),
+    };
+    let mut rest = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--replay" => {
+                session.replay = Some(PathBuf::from(args.next().ok_or("--replay requires a session file")?));
+            }
+            "--replay-paused" | "--replay_paused" => session.paused = true,
+            "--no-session-log" | "--no_session_log" => session.record = false,
+            // Not sessions of the window: a headless run, the tutorial
+            // window (a second process), the help.
+            "--run" | "-h" | "--help" | help::INSTRUCTIONS_FLAG => {
+                session.record = false;
+                rest.push(a);
+            }
+            _ => rest.push(a),
+        }
+    }
+    Ok((rest, session))
+}
+
 fn main() -> eframe::Result<()> {
     // The classic GTK file chooser (with a typeable path and a starting
     // folder), never the XDG portal dialog, which ignores set_directory.
@@ -579,10 +633,72 @@ fn main() -> eframe::Result<()> {
     // Shared VENUS log (dehydration_hydration_<user>.log; the beta build
     // has its own dehydration_hydration_beta_<user>.log), so what a user did and where
     // it failed can be read back in the log browser.
+    // The session log, before anything else (it saves the preferences the
+    // session starts from): either this session is recorded, or — with
+    // `--replay` — a recorded one is replayed, from its own command line.
+    let (mut argv, session) = match split_session_args(std::env::args().skip(1).collect()) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("Error: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let mut session_note = None;
+    // The notice that the sessions are recorded: for the first one that is.
+    let mut recording_notice = false;
+    let replaying = session.replay.is_some();
+    if let Some(file) = &session.replay {
+        match session_replay::start_replay(file, session.paused) {
+            Ok(header) => {
+                if header.app != privacy::APP {
+                    eprintln!("Error: {} is a session of {}, not of this tool", file.display(), header.app);
+                    std::process::exit(2);
+                }
+                session_note = Some(format!(
+                    "Session log: REPLAY of {} (user {}, {})",
+                    file.display(),
+                    header.user,
+                    header.started
+                ));
+                argv = header.argv;
+                // As the recorded session started (its preferences are the
+                // ones in effect from here on).
+                recording_notice = privacy::notice_pending();
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let private = !replaying && session.record && privacy::load();
+    if private {
+        session_note = Some("Session log: private mode, this session is not recorded".to_owned());
+    } else if !replaying && session.record {
+        // Before the recording starts: the session saves whether the notice
+        // was shown.
+        let notice = privacy::notice_begin();
+        match session_replay::start_recording(session_replay::RecordOptions {
+            app: privacy::APP,
+            app_version: env!("CARGO_PKG_VERSION"),
+            argv: argv.clone(),
+            // What a session starts from: the theme and the zoom of the
+            // VENUS tools, the folders recently opened.
+            pref_files: &["theme", "zoom", "dehydration_hydration_recent", privacy::NOTICE_FILE],
+        }) {
+            Ok(path) => {
+                recording_notice = notice;
+                session_note = Some(format!("Session log: recording to {}", path.display()));
+            }
+            Err(e) => eprintln!("Warning: session not recorded — {e}"),
+        }
+    }
     if let Err(e) = logger::init() {
         eprintln!("Warning: logging disabled — {e}");
     }
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(note) = session_note {
+        logger::log(note);
+    }
     logger::log(format!(
         "Command line: dehydration_hydration ({}) {}",
         variant::label(),
@@ -597,6 +713,8 @@ fn main() -> eframe::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         logger::error(format!("PANIC: {info}"));
+        // On disk in the session too, before the process dies.
+        session_replay::flush();
         default_hook(info);
     }));
 
@@ -626,7 +744,7 @@ fn main() -> eframe::Result<()> {
         return result;
     }
 
-    let cli = match parse_args() {
+    let cli = match parse_args(argv.clone()) {
         Ok(cli) => cli,
         Err(e) => {
             logger::error(format!("Invalid command line: {e}"));
@@ -691,6 +809,10 @@ fn main() -> eframe::Result<()> {
             if let Some(run) = run_number {
                 app.set_startup_run(run);
             }
+            app.set_private_mode(private);
+            if recording_notice {
+                app.show_recording_notice();
+            }
             Ok(Box::new(app))
         }),
     );
@@ -698,5 +820,8 @@ fn main() -> eframe::Result<()> {
         Ok(()) => logger::log("Application closed"),
         Err(e) => logger::error(format!("Application failed: {e}")),
     }
+    // A session file without this last line is one whose application
+    // crashed or was killed.
+    session_replay::shutdown(if result.is_ok() { "closed" } else { "failed" });
     result
 }

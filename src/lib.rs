@@ -5,6 +5,9 @@
 //!
 //! The GUI binary (`main.rs`) is a thin shell around these modules; they are
 //! exposed here so they can be unit/integration tested without a display.
+//!
+//! What is done in the window is recorded for the Session Replay tool
+//! (`main.rs`, [`privacy`]); what a replay does differently is in [`replay`].
 
 pub mod app;
 pub mod colormap;
@@ -16,7 +19,9 @@ pub mod hsnt_cli;
 pub mod loader;
 pub mod logger;
 pub mod mask;
+pub mod privacy;
 pub mod recent;
+pub mod replay;
 pub mod run_lookup;
 pub mod spectra;
 pub mod theme;

@@ -446,6 +446,8 @@ pub struct DehydrationApp {
     /// The export under way is the one handed back: when it is written, its
     /// folder is printed for the calling application and the window closes.
     handback_export: bool,
+    /// The private mode (sessions not recorded): its button and window.
+    private: crate::privacy::Private,
     close_now: bool,
     /// `--mask`: the mask image applied to the stack given at startup.
     startup_mask: Option<PathBuf>,
@@ -582,6 +584,7 @@ impl DehydrationApp {
             last_export: None,
             handback_dir: None,
             handback_export: false,
+            private: crate::privacy::Private::new(false),
             close_now: false,
             startup_mask: None,
             run_log: Vec::new(),
@@ -640,9 +643,23 @@ impl DehydrationApp {
     }
 
     /// Correction parameters given on the command line.
+    /// The private mode as the user left it (`on`: not to be recorded).
+    pub fn set_private_mode(&mut self, on: bool) {
+        self.private = crate::privacy::Private::new(on);
+    }
+
+    /// Tell the user their sessions are recorded (the first one that is, see
+    /// [`crate::privacy::notice_begin`]) — or, in a replay, show the notice
+    /// the recorded session started with.
+    pub fn show_recording_notice(&mut self) {
+        self.private.notify();
+    }
+
     /// `--called-from-app`: another application opened this window to get
     /// the corrected stack back, written under `export_dir`.
     pub fn set_called_from_app(&mut self, export_dir: PathBuf) {
+        // In a replay: the stand-in of that folder under its scratch folder.
+        let export_dir = crate::replay::output(export_dir);
         logger::log(format!("Called from another application: the corrected stack goes to {}", export_dir.display()));
         self.handback_dir = Some(export_dir);
     }
@@ -935,7 +952,7 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.pick_file() else {
+        let Some(path) = session_replay::external("Load mask", session_replay::Kind::Open, || dialog.pick_file()) else {
             logger::log("Load mask: dialog cancelled");
             return;
         };
@@ -966,7 +983,7 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.save_file() else {
+        let Some(path) = session_replay::external("Save mask", session_replay::Kind::Save, || dialog.save_file()) else {
             logger::log("Save mask: dialog cancelled");
             return;
         };
@@ -2079,7 +2096,8 @@ impl DehydrationApp {
         if let Some(parent) = self.input_dir.as_ref().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(parent);
         }
-        let Some(output_dir) = dialog.pick_folder() else {
+        // In a replay: the stand-in of that folder under its scratch folder.
+        let Some(output_dir) = session_replay::external("Export folder", session_replay::Kind::Save, || dialog.pick_folder()).map(crate::replay::output) else {
             logger::log("Export: dialog cancelled");
             return;
         };
@@ -2161,7 +2179,7 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.save_file() else {
+        let Some(path) = session_replay::external("Save profiles CSV", session_replay::Kind::Save, || dialog.save_file()) else {
             logger::log("Save CSV: dialog cancelled");
             return;
         };
@@ -2598,12 +2616,13 @@ impl DehydrationApp {
     // ----- dialogs -----------------------------------------------------------
 
     fn open_files_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(files) = rfd::FileDialog::new()
-            .add_filter("Images", loader::SUPPORTED_EXTENSIONS)
-            .set_title("Open TIFF image(s)")
-            .set_directory(self.dialog_start_dir())
-            .pick_files()
-        {
+        if let Some(files) = session_replay::external("Open Files", session_replay::Kind::Open, || {
+            rfd::FileDialog::new()
+                .add_filter("Images", loader::SUPPORTED_EXTENSIONS)
+                .set_title("Open TIFF image(s)")
+                .set_directory(self.dialog_start_dir())
+                .pick_files()
+        }) {
             logger::log(format!("Open Files: {} file(s) picked", files.len()));
             self.start_load(files, ctx);
         } else {
@@ -2647,11 +2666,12 @@ impl DehydrationApp {
     }
 
     fn open_folder_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(dir) = rfd::FileDialog::new()
-            .set_title("Open the folder containing the images to correct")
-            .set_directory(self.dialog_start_dir())
-            .pick_folder()
-        {
+        if let Some(dir) = session_replay::external("Open Folder", session_replay::Kind::Open, || {
+            rfd::FileDialog::new()
+                .set_title("Open the folder containing the images to correct")
+                .set_directory(self.dialog_start_dir())
+                .pick_folder()
+        }) {
             logger::log(format!("Open Folder: {}", dir.display()));
             match loader::list_supported_in_dir(&dir) {
                 Ok(files) => self.start_load(files, ctx),
@@ -3154,7 +3174,7 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.save_file() else {
+        let Some(path) = session_replay::external("Save settings", session_replay::Kind::Save, || dialog.save_file()) else {
             logger::log("Save settings: dialog cancelled");
             return;
         };
@@ -3177,7 +3197,7 @@ impl DehydrationApp {
         if let Some(dir) = &self.input_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.pick_file() else {
+        let Some(path) = session_replay::external("Load settings", session_replay::Kind::Open, || dialog.pick_file()) else {
             logger::log("Load settings: dialog cancelled");
             return;
         };
@@ -3210,6 +3230,7 @@ impl DehydrationApp {
                 }
                 crate::zoom::toggle_button(ui);
                 crate::theme::toggle_button(ui);
+                self.private.toolbar_button(ui);
                 let has_plots = self
                     .result
                     .as_ref()
@@ -5218,5 +5239,15 @@ impl eframe::App for DehydrationApp {
         self.about_modal(&ctx);
         self.log_window(&ctx);
         self.diagnostics_window(&ctx);
+        self.private.window(&ctx);
+        // During a replay: the replayed pointer and the state of the replay.
+        session_replay::overlay(&ctx);
+    }
+
+    /// The session log: the input of every frame is recorded — or, during
+    /// a replay (`--replay`), replaced by the recorded one. Does nothing
+    /// when neither is going on.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        session_replay::raw_input_hook(ctx, raw_input);
     }
 }

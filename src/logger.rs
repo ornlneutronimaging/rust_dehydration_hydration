@@ -66,6 +66,9 @@ pub fn init() -> Result<PathBuf, String> {
 }
 
 fn write_line(level: &str, msg: &str) {
+    // Also a line of the session log (what the user did, to replay it):
+    // readable context there, and what a replay is synchronized on.
+    session_replay::note(level, msg);
     if let Some(mutex) = SINK.get().and_then(|s| s.as_ref())
         && let Ok(mut file) = mutex.lock()
     {

@@ -7,6 +7,10 @@ description = "Dehydration/hydration denoising of a TIFF image stack with the ma
 [dependencies]
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
 detector_orientation = { path = "../rust_detector_orientation" }
+# The session log: what the user does (input, dialogs, log lines) recorded
+# to /SNS/VENUS/shared/log/sessions, and replayed with `--replay <file>` /
+# the Session Replay tool to reproduce a bug.
+session_replay = { path = "../rust_session_replay", default-features = false }
 anyhow = "1.0"
 chrono = "0.4"
 libc = "0.2"
@@ -19,6 +23,7 @@ egui_plot = "0.36"
 ndarray = { version = "0.17", features = ["rayon"] }
 ndarray-npy = "0.10"
 rayon = "1.11"
+serde = "1"
 serde_json = "1.0"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 tiff = "0.11"

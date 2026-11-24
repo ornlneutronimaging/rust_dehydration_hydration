@@ -275,6 +275,32 @@ ended, exports, errors) to the shared VENUS log
 timestamped line per event; the file is readable in the Log Browser
 (`rust_log_browser`), like the logs of the other VENUS tools.
 
+## Session recording and private mode
+
+What is done in the window (the data selected, the pointer, the clicks, the
+keys, what is typed or pasted, the answers of the file dialogs) is also
+recorded, one file per session in `/SNS/VENUS/shared/log/sessions`, so that
+the imaging team can replay a session step by step with the **Session
+Replay** tool (`../rust_session_replay`). The data itself is not copied. The
+first time a session of yours is recorded, a notice at start-up says so. The
+recordings can be read by you and the imaging team only, and are deleted
+after 30 days. A headless run (`--run`) and the tutorial window are never
+recorded.
+
+The **🔒** button of the toolbar (top right) turns the recording off
+(private mode): it deletes the recording of the session in progress — and,
+if you tick it, the recordings of your earlier sessions — and stays on until
+you turn it off again. `--no-session-log` or `VENUS_SESSION_LOG=0` turn the
+recording off for one run.
+
+`dehydration_hydration --replay <session file> [--replay-paused]` replays a
+session (this is what the Session Replay tool starts). A replay does
+everything the user did, the correction (on the GPU) and the export
+included, but never on their files (`src/replay.rs`): what the session
+wrote — the exported stack, a mask, the profiles, the settings, the folder
+a calling application gave — is written under
+`/tmp/session_replay_<you>/<pid>/`, and the tutorial window is not started.
+
 ## Implementation notes
 
 - `src/hsnt_cli.rs`: parameters ↔ CLI arguments, exchange HDF5 writer /

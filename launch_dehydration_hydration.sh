@@ -22,7 +22,7 @@ fi
 needs_build=false
 if [[ ! -x "$BINARY" ]]; then
     needs_build=true
-elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" "$REPO_DIR/../rust_detector_orientation/src" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
+elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" "$REPO_DIR/../rust_detector_orientation/src" "$REPO_DIR/../rust_session_replay/src" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
     needs_build=true
 fi
 
@@ -34,7 +34,16 @@ if $needs_build; then
         exit 1
     fi
     echo "Building dehydration_hydration (release)..."
-    (cd "$REPO_DIR" && "$CARGO" build --release)
+    # A build that fails (a shared crate being worked on…) must not keep the
+    # tool from starting: the binary already there is launched.
+    if ! (cd "$REPO_DIR" && "$CARGO" build --release); then
+        if [[ -x "$BINARY" ]]; then
+            echo "Warning: the build failed; launching the existing binary." >&2
+        else
+            echo "Error: the build failed and there is no binary to launch." >&2
+            exit 1
+        fi
+    fi
 fi
 
 # Classic GTK file chooser (typeable path, honors the starting folder), not
